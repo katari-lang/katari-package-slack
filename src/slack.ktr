@@ -1,0 +1,91 @@
+// The Slack library: a Socket Mode connection capability plus the watch / send agents, the Slack twin
+// of the Discord package. The externals are implemented in `slack.ts` (the same module path, so they
+// register under `slack.*`). The one-line integration is the provider:
+// `use slack.provider(bot_token = env.get_secret(key = "SLACK_BOT_TOKEN"), app_token = env.get_secret(key = "SLACK_APP_TOKEN"))`.
+//
+// Socket Mode needs no public URL and no request-signature verification: the sidecar opens an outbound
+// WebSocket with the app-level token (`xapp-…`) and Slack pushes events over it, while the bot token
+// (`xoxb-…`) drives the Web API (posting, uploads, attachment downloads). Both tokens stay inside the
+// sidecar, keyed by the opaque client handle — they are never served as a value.
+//
+// Files are first-class on both directions: an incoming message's attachments arrive as `file` values
+// (the sidecar downloads each from Slack's authenticated file URL and uploads it over the blob side
+// channel), and `send_message` posts `file` values back as Slack uploads (`files.uploadV2`).
+
+@"The live Slack connection (the Socket Mode and Web API clients live in the sidecar; the handle is
+opaque)."
+request get_slack_client() -> string
+
+@"Provide the Slack connection for the extent of the continuation: connect once over Socket Mode, then
+serve `get_slack_client` to everything downstream."
+agent provider[R, effect E](
+  @"The bot token (`xoxb-…`) every Web API call authenticates with." bot_token: string of private,
+  @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
+  @"Runs with `get_slack_client` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, get_slack_client},
+) -> R with E | io {
+  use handler (var client = create_slack_client(bot_token = bot_token, app_token = app_token)) {
+    request get_slack_client() { next client }
+  }
+  continuation(value = null)
+}
+
+@"Connect to Slack — open the Socket Mode WebSocket and the Web API client — and return an opaque
+client handle. Prefer the provider."
+external agent create_slack_client(
+  @"The bot token (`xoxb-…`) every Web API call authenticates with." bot_token: string of private,
+  @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
+) -> string
+
+@"Low-level: post to a channel on a given client — a thread reply when @thread_ts@ carries a `ts`, a
+channel post when it is `null`; any files upload as attachments. Prefer the send_message agent."
+external agent slack_send(
+  @"The opaque handle `create_slack_client` returned." client: string,
+  @"The id of the channel to post in (e.g. \"C0123456789\")." channel: string,
+  @"The message text (Slack mrkdwn); with files it becomes their caption." text: string,
+  @"The parent message's `ts` to reply in its thread, or `null` to post to the channel." thread_ts: string | null,
+  @"Files to upload as the message's attachments (`[]` for a plain text post)." files: array[file],
+) -> null
+
+@"Low-level: listen on a channel and deliver each incoming message (channel / user / text / thread_ts /
+attachments as files) to a callback. Prefer the watch_messages agent."
+external agent slack_watch[effect E](
+  @"The opaque handle `create_slack_client` returned." client: string,
+  @"The id of the channel to listen on; messages elsewhere are ignored." channel: string,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, user: string, text: string, thread_ts: string | null, files: array[file]) -> null with E,
+) -> never with E
+
+@"Post a message to a channel using the ambient Slack client. Pass a message's `ts` as @thread_ts@ to
+reply in its thread (an incoming message's @thread_ts@ passed straight back replies where it came
+from); @files@ upload as attachments (pass `[]` for a plain text post — parameter defaults only take
+literals, so the empty array cannot default)."
+agent send_message(
+  @"The id of the channel to post in (e.g. \"C0123456789\")." channel: string,
+  @"The message text (Slack mrkdwn); with files it becomes their caption." text: string,
+  @"Files to upload as the message's attachments (`[]` for a plain text post)." files: array[file],
+  @"The parent message's `ts` to reply in its thread; omit (or pass `null`) to post to the channel." thread_ts: string | null ?= null,
+) -> null {
+  slack_send(client = get_slack_client(), channel = channel, text = text, thread_ts = thread_ts, files = files)
+}
+
+@"Tool: post files (images, documents) to a Slack channel, with a caption. Use the channel id given in
+the conversation context; pass each file as its handle object — a bare {\"$ref\": \"<id>\"} suffices."
+agent send_files(
+  @"The id of the channel to post in, from the conversation context." channel: string,
+  @"The files to upload, each passed as its handle object." files: array[file],
+  @"The text posted alongside the files." caption: string,
+) -> null {
+  send_message(channel = channel, text = caption, files = files)
+}
+
+@"Serve a channel forever, delivering each incoming message to @deliver_to@ — shaped like
+`time.watch` / `calendar.watch` so it composes under `parallel [ … ]`. The bot's own posts (and other
+bots') are not delivered, so replying from @deliver_to@ cannot loop. A delivered @thread_ts@ is the
+thread the message was posted in, or `null` for a top-level message — pass it straight to
+`send_message` to reply where the message came from. Delivery is at-least-once: Slack re-sends an
+event whose acknowledgement was lost, and no dedup memory is kept here."
+agent watch_messages[effect E](
+  @"The id of the channel to listen on (e.g. \"C0123456789\")." channel: string,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, user: string, text: string, thread_ts: string | null, files: array[file]) -> null with E,
+) -> never with E | get_slack_client | io {
+  slack_watch(client = get_slack_client(), channel = channel, deliver_to = deliver_to)
+}

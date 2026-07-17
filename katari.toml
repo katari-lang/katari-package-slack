@@ -1,0 +1,15 @@
+[package]
+name = "slack"
+version = "0.1.0"
+description = "A Slack bot capability over Socket Mode: watch channel messages and post replies (threads and files included). Ships an FFI sidecar (slack.ts)."
+
+[runtime]
+url = "http://localhost:3000"
+
+# The sidecar's source root defaults to [package].src ("src"), where slack.ts lives alongside slack.ktr,
+# so no explicit [sidecar] section is needed — `katari apply` bundles it into the consumer's snapshot.
+
+[dependencies]
+registry = "https://raw.githubusercontent.com/katari-lang/katari-registry/main"
+snapshot = "staging"
+packages = []

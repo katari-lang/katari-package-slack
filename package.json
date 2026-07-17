@@ -1,0 +1,19 @@
+{
+  "name": "katari-package-slack",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "FFI sidecar dependencies for the Katari `slack` package (src/slack.ts).",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@katari-lang/port": "0.1.0-rc8",
+    "@slack/socket-mode": "^3.0.0",
+    "@slack/web-api": "^8.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^5.9.0"
+  }
+}
