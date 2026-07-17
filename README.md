@@ -28,7 +28,7 @@ no dedup memory is kept here.
 
 ## Slack app setup
 
-1. Create an app at <https://api.slack.com/apps> ("From scratch").
+1. Create an app at [api.slack.com/apps](https://api.slack.com/apps) ("From scratch").
 2. **Socket Mode**: Settings → Socket Mode → enable it. Generate the app-level token with the
    `connections:write` scope — this is the `xapp-…` token (`SLACK_APP_TOKEN`).
 3. **Scopes**: Features → OAuth & Permissions → Bot Token Scopes: add `chat:write` (post messages),
