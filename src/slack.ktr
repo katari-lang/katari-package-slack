@@ -78,7 +78,7 @@ agent send_files(
 }
 
 @"Serve a channel forever, delivering each incoming message to @deliver_to@ — shaped like
-`time.watch` / `calendar.watch` so it composes under `parallel [ … ]`. The bot's own posts (and other
+`time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. The bot's own posts (and other
 bots') are not delivered, so replying from @deliver_to@ cannot loop. A delivered @thread_ts@ is the
 thread the message was posted in, or `null` for a top-level message — pass it straight to
 `send_message` to reply where the message came from. Delivery is at-least-once: Slack re-sends an
