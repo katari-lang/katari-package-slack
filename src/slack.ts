@@ -10,9 +10,53 @@
 // carries real `file` values.
 
 import { Buffer } from "node:buffer";
-import { katari, type KatariAgent, type KatariFile } from "@katari-lang/port";
+import { katari, KatariData, type KatariAgent, type KatariFile } from "@katari-lang/port";
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
+
+/** Read a property off an unknown value without asserting its shape. */
+function property(value: unknown, key: string): unknown {
+  return typeof value === "object" && value !== null ? Reflect.get(value, key) : undefined;
+}
+
+/** Slack error codes that mean the credential itself is unusable — the operator must fix the token or
+ *  scopes; the bot cannot recover on its own. Everything else is classified as a (usually transient or
+ *  per-message) `api_error`. */
+const SLACK_AUTH_CODES = new Set([
+  "not_authed",
+  "invalid_auth",
+  "account_inactive",
+  "token_revoked",
+  "token_expired",
+  "missing_scope",
+  "no_permission",
+  "not_allowed_token_type",
+  "ekm_access_denied",
+]);
+
+/** The Slack platform error code out of a failed Web API call (`chat.postMessage` / `files.uploadV2`
+ *  reject with a `WebAPICallError` whose `data.error` is the code, e.g. "invalid_auth"), or undefined
+ *  when the failure carries none (a transport fault). */
+function slackErrorCode(error: unknown): string | undefined {
+  const code = property(property(error, "data"), "error");
+  return typeof code === "string" && code.length > 0 ? code : undefined;
+}
+
+/** The human-readable message for a `slack_error` payload: the platform code, else the JS message. */
+function slackErrorMessage(error: unknown): string {
+  const code = slackErrorCode(error);
+  if (code !== undefined) return code;
+  const message = property(error, "message");
+  if (typeof message === "string" && message.length > 0) return message;
+  return String(error);
+}
+
+/** The qualified `slack_error` constructor for a failure: an unusable credential is `auth_error`,
+ *  everything else (rate limit, transport, a per-channel refusal) is `api_error`. */
+function slackErrorConstructor(error: unknown): string {
+  const code = slackErrorCode(error);
+  return code !== undefined && SLACK_AUTH_CODES.has(code) ? "slack.auth_error" : "slack.api_error";
+}
 
 /** One live connection: the event socket, the Web API client, and the bot token the attachment
  *  downloads authenticate with. */
@@ -84,41 +128,51 @@ katari.agent<{
   thread_ts: string | null;
   files: KatariFile[];
 }>("slack_send", async ({ client, channel, text, thread_ts, files }) => {
+  // An unknown handle is a program defect (a `client` value the runtime never minted), so it stays a
+  // bare throw = panic; only the Slack API calls below fail at execution and become a catchable
+  // `slack_error`.
   const connection = connectionOf(client);
-  if (files.length === 0) {
-    await connection.web.chat.postMessage({
-      channel,
-      text,
-      ...(thread_ts === null ? {} : { thread_ts }),
-    });
+  try {
+    if (files.length === 0) {
+      await connection.web.chat.postMessage({
+        channel,
+        text,
+        ...(thread_ts === null ? {} : { thread_ts }),
+      });
+      return null;
+    }
+    // Each file's bytes come over the blob side channel; Slack's upload wants a Buffer + a filename. The
+    // slim handle carries no metadata, so the MIME type rides in with the same download. `uploadV2`
+    // shares every file into the channel in one post, with the text as its caption (`initial_comment`).
+    const uploads = await Promise.all(
+      files.map(async (file, index) => ({
+        file: Buffer.from(await file.bytes()),
+        filename: attachmentName(await file.contentType(), index),
+      })),
+    );
+    // The two calls differ only in `thread_ts`, but the SDK types the thread destination as requiring
+    // it and the channel destination as forbidding it, so the branch keeps both object literals honest.
+    if (thread_ts === null) {
+      await connection.web.files.uploadV2({
+        channel_id: channel,
+        ...(text === "" ? {} : { initial_comment: text }),
+        file_uploads: uploads,
+      });
+    } else {
+      await connection.web.files.uploadV2({
+        channel_id: channel,
+        thread_ts,
+        ...(text === "" ? {} : { initial_comment: text }),
+        file_uploads: uploads,
+      });
+    }
     return null;
+  } catch (error) {
+    // Raise the execution failure as the declared `prelude.throw[slack_error]`, classified auth vs api
+    // (qualified constructor name — the boundary checks the tag against the schema const), so the
+    // caller can catch it instead of the run panicking.
+    katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
   }
-  // Each file's bytes come over the blob side channel; Slack's upload wants a Buffer + a filename. The
-  // slim handle carries no metadata, so the MIME type rides in with the same download. `uploadV2`
-  // shares every file into the channel in one post, with the text as its caption (`initial_comment`).
-  const uploads = await Promise.all(
-    files.map(async (file, index) => ({
-      file: Buffer.from(await file.bytes()),
-      filename: attachmentName(await file.contentType(), index),
-    })),
-  );
-  // The two calls differ only in `thread_ts`, but the SDK types the thread destination as requiring
-  // it and the channel destination as forbidding it, so the branch keeps both object literals honest.
-  if (thread_ts === null) {
-    await connection.web.files.uploadV2({
-      channel_id: channel,
-      ...(text === "" ? {} : { initial_comment: text }),
-      file_uploads: uploads,
-    });
-  } else {
-    await connection.web.files.uploadV2({
-      channel_id: channel,
-      thread_ts,
-      ...(text === "" ? {} : { initial_comment: text }),
-      file_uploads: uploads,
-    });
-  }
-  return null;
 });
 
 katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(

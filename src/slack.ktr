@@ -36,15 +36,33 @@ external agent create_slack_client(
   @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
 ) -> string
 
+@"An authentication / authorization failure: the bot token is invalid, revoked, or missing a scope the
+call needs (Slack `invalid_auth`, `token_revoked`, `missing_scope`, …); @message@ carries Slack's error
+string. The bot cannot recover on its own — the operator must fix the token or scopes and restart the
+run (the connection is fixed at start). Let it surface so the bot stops loudly rather than silently
+dropping every reply."
+data auth_error(message: string)
+
+@"A Slack API call failed for a non-auth reason: a rate limit, a transient network fault, a channel the
+bot is not in, a message too long; @message@ carries Slack's error string. Usually per-message or
+transient, so a bot catches it to drop just that reply and keep serving."
+data api_error(message: string)
+
+// A Slack send failure: an auth/authorization failure or a plain API failure. Raised as a
+// `prelude.throw` (never a panic — that would tear the whole run down), classified in the sidecar by
+// Slack's error code. (Type synonyms take no docs.)
+type slack_error = auth_error | api_error
+
 @"Low-level: post to a channel on a given client — a thread reply when @thread_ts@ carries a `ts`, a
-channel post when it is `null`; any files upload as attachments. Prefer the send_message agent."
+channel post when it is `null`; any files upload as attachments. Raises `auth_error` or `api_error`
+(`slack_error`) when the Slack API call fails. Prefer the send_message agent."
 external agent slack_send(
   @"The opaque handle `create_slack_client` returned." client: string,
   @"The id of the channel to post in (e.g. \"C0123456789\")." channel: string,
   @"The message text (Slack mrkdwn); with files it becomes their caption." text: string,
   @"The parent message's `ts` to reply in its thread, or `null` to post to the channel." thread_ts: string | null,
   @"Files to upload as the message's attachments (`[]` for a plain text post)." files: array[file],
-) -> null
+) -> null with prelude.throw[slack_error]
 
 @"Low-level: listen on a channel and deliver each incoming message (channel / user / text / thread_ts /
 attachments as files) to a callback. Prefer the watch_messages agent."
@@ -57,7 +75,9 @@ external agent slack_watch[effect E](
 @"Post a message to a channel using the ambient Slack client. Pass a message's `ts` as @thread_ts@ to
 reply in its thread (an incoming message's @thread_ts@ passed straight back replies where it came
 from); @files@ upload as attachments (pass `[]` for a plain text post — parameter defaults only take
-literals, so the empty array cannot default)."
+literals, so the empty array cannot default). Raises `slack_error` (`auth_error` | `api_error`) when the
+send fails — catch `api_error` to keep a bot serving past a transient failure, and let `auth_error`
+surface so a bad token stops the bot loudly."
 agent send_message(
   @"The id of the channel to post in (e.g. \"C0123456789\")." channel: string,
   @"The message text (Slack mrkdwn); with files it becomes their caption." text: string,
