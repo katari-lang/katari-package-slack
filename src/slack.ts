@@ -113,7 +113,15 @@ katari.agent<{ bot_token: string; app_token: string }>(
     socket.on("slack_event", ({ ack }: { ack: () => Promise<void> }) => {
       void ack().catch(() => {});
     });
-    await socket.start();
+    try {
+      // Opening the Socket Mode WebSocket is the connect: a bad app-level token or a transient network
+      // fault fails here. Raise it as the declared `prelude.throw[slack_error]`, classified auth vs api
+      // (the credential is fixed at start, so a bad token cannot recover), so the provider's caller can
+      // catch it instead of the run panicking. Nothing to close — the socket never came up.
+      await socket.start();
+    } catch (error) {
+      katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
+    }
     const handle = `slack-${nextHandle}`;
     nextHandle += 1;
     clients.set(handle, { socket, web: new WebClient(bot_token), botToken: bot_token });

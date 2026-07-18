@@ -17,12 +17,14 @@ opaque)."
 request get_slack_client() -> string
 
 @"Provide the Slack connection for the extent of the continuation: connect once over Socket Mode, then
-serve `get_slack_client` to everything downstream."
+serve `get_slack_client` to everything downstream. A failed connect (a bad `xapp-…` token, a transient
+network fault) raises `slack_error` (`auth_error` | `api_error`) — the connection is fixed at start, so a
+bad credential surfaces here rather than on the first send."
 agent provider[R, effect E](
   @"The bot token (`xoxb-…`) every Web API call authenticates with." bot_token: string of private,
   @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
   @"Runs with `get_slack_client` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, get_slack_client},
-) -> R with E | io {
+) -> R with E | io | prelude.throw[slack_error] {
   let client = create_slack_client(bot_token = bot_token, app_token = app_token)
   // Bind the socket's lifetime to this run: however the provider ends — normal completion, cancel, or
   // the continuation unwinding — close the connection on the way out. A socket left open keeps
@@ -36,11 +38,12 @@ agent provider[R, effect E](
 }
 
 @"Connect to Slack — open the Socket Mode WebSocket and the Web API client — and return an opaque
-client handle. Prefer the provider."
+client handle. Raises `slack_error` (`auth_error` | `api_error`) when the connect fails — a bad
+app-level token is `auth_error`, a transient network fault `api_error`. Prefer the provider."
 external agent create_slack_client(
   @"The bot token (`xoxb-…`) every Web API call authenticates with." bot_token: string of private,
   @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
-) -> string
+) -> string with prelude.throw[slack_error]
 
 @"Close a Slack connection: disconnect the Socket Mode WebSocket and drop the client handle. The
 provider arms this as a `finally`, so the connection dies with the run — a socket left open keeps
