@@ -23,7 +23,13 @@ agent provider[R, effect E](
   @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
   @"Runs with `get_slack_client` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, get_slack_client},
 ) -> R with E | io {
-  use handler (var client = create_slack_client(bot_token = bot_token, app_token = app_token)) {
+  let client = create_slack_client(bot_token = bot_token, app_token = app_token)
+  // Bind the socket's lifetime to this run: however the provider ends — normal completion, cancel, or
+  // the continuation unwinding — close the connection on the way out. A socket left open keeps
+  // receiving events, and Slack round-robins each event across every socket open on the app token, so a
+  // dead run's zombie socket would swallow messages (acking them) that a live bot then never sees.
+  finally { slack_close(client = client) }
+  use handler {
     request get_slack_client() { next client }
   }
   continuation(value = null)
@@ -35,6 +41,16 @@ external agent create_slack_client(
   @"The bot token (`xoxb-…`) every Web API call authenticates with." bot_token: string of private,
   @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
 ) -> string
+
+@"Close a Slack connection: disconnect the Socket Mode WebSocket and drop the client handle. The
+provider arms this as a `finally`, so the connection dies with the run — a socket left open keeps
+receiving events, and Slack round-robins each event across every socket open on the app token, so a
+dead run's zombie socket would swallow messages (acking them) that a live bot then never sees.
+Idempotent: closing an unknown or already-closed handle is a no-op, since a finalizer may run more
+than once."
+external agent slack_close(
+  @"The opaque handle `create_slack_client` returned." client: string,
+) -> null
 
 @"An authentication / authorization failure: the bot token is invalid, revoked, or missing a scope the
 call needs (Slack `invalid_auth`, `token_revoked`, `missing_scope`, …); @message@ carries Slack's error

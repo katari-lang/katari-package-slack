@@ -121,6 +121,23 @@ katari.agent<{ bot_token: string; app_token: string }>(
   },
 );
 
+katari.agent<{ client: string }>("slack_close", async ({ client }) => {
+  // The provider arms this as a `finally`, so a run that ends (completes, is cancelled, or unwinds)
+  // tears its Socket Mode connection down: a socket left open keeps receiving events, and Slack
+  // round-robins each event across every socket open on the app token, so a dead run's zombie socket
+  // would swallow messages (acking them) that a live bot then never sees.
+  const connection = clients.get(client);
+  // Idempotent: an unknown or already-closed handle is a no-op — a finalizer may run more than once,
+  // and a sidecar restart drops the map entirely.
+  if (connection === undefined) return null;
+  // Drop the entry before disconnecting so a re-run (or a concurrent lookup) cannot see it half-closed.
+  clients.delete(client);
+  // `disconnect` ends the Socket Mode session — the SDK's documented shutdown: it stops reconnecting
+  // and closes the WebSocket. The Web API client holds no persistent connection, so nothing to close.
+  await connection.socket.disconnect();
+  return null;
+});
+
 katari.agent<{
   client: string;
   channel: string;
