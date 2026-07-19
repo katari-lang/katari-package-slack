@@ -107,7 +107,7 @@ agent send_message(
 }
 
 @"Tool: post files (images, documents) to a Slack channel, with a caption. Use the channel id given in
-the conversation context; pass each file as its handle object — a bare {\"$ref\": \"<id>\"} suffices."
+the conversation context; pass each file as its handle object — a bare {\"$katari_ref\": \"<id>\"} suffices."
 agent send_files(
   @"The id of the channel to post in, from the conversation context." channel: string,
   @"The files to upload, each passed as its handle object." files: array[file],
