@@ -1,7 +1,7 @@
 // The Slack library: a Socket Mode connection capability plus the watch / send agents, the Slack twin
 // of the Discord package. The externals are implemented in `slack.ts` (the same module path, so they
 // register under `slack.*`). The one-line integration is the provider:
-// `use slack.provider(bot_token = env.get_secret(key = "SLACK_BOT_TOKEN"), app_token = env.get_secret(key = "SLACK_APP_TOKEN"))`.
+// `use slack.provider(bot_source = credentials.env(key = "SLACK_BOT_TOKEN"), app_source = credentials.env(key = "SLACK_APP_TOKEN"))`.
 //
 // Socket Mode needs no public URL and no request-signature verification: the sidecar opens an outbound
 // WebSocket with the app-level token (`xapp-…`) and Slack pushes events over it, while the bot token
@@ -14,25 +14,27 @@
 
 @"The live Slack connection (the Socket Mode and Web API clients live in the sidecar; the handle is
 opaque)."
-request get_slack_client() -> string
+request connection() -> string
 
-@"Provide the Slack connection for the extent of the continuation: connect once over Socket Mode, then
-serve `get_slack_client` to everything downstream. A failed connect (a bad `xapp-…` token, a transient
-network fault) raises `slack_error` (`auth_error` | `api_error`) — the connection is fixed at start, so a
-bad credential surfaces here rather than on the first send."
+@"Provide the Slack connection for the extent of the continuation: resolve the two sources ONCE (a
+socket credential is fixed at connect — a rotation lands on the next restart, not mid-connection),
+connect over Socket Mode, then serve `connection` to everything downstream. A failed connect (a bad
+`xapp-…` token, a transient network fault) raises `slack_error` (`auth_error` | `api_error`) —
+surfacing here rather than on the first send. Slack genuinely takes TWO credentials, so there are two
+sources: the bot token (`xoxb-…`, the Web API) and the app-level token (`xapp-…`, the socket)."
 agent provider[R, effect E](
-  @"The bot token (`xoxb-…`) every Web API call authenticates with." bot_token: string of private,
-  @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
-  @"Runs with `get_slack_client` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, get_slack_client},
-) -> R with E | io | prelude.throw[slack_error] {
-  let client = create_slack_client(bot_token = bot_token, app_token = app_token)
+  @"Where the bot token (`xoxb-…`) lives; resolved once at connect." bot_source: credentials.source,
+  @"Where the app-level token (`xapp-…`) lives; resolved once at connect." app_source: credentials.source,
+  @"Runs with `connection` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, connection},
+) -> R with E | io | prelude.throw[slack_error | env.missing_secret | oauth.server_error] {
+  let client = create_slack_client(bot_token = credentials.resolve(source = bot_source), app_token = credentials.resolve(source = app_source))
   // Bind the socket's lifetime to this run: however the provider ends — normal completion, cancel, or
   // the continuation unwinding — close the connection on the way out. A socket left open keeps
   // receiving events, and Slack round-robins each event across every socket open on the app token, so a
   // dead run's zombie socket would swallow messages (acking them) that a live bot then never sees.
   finally { slack_close(client = client) }
   use handler {
-    request get_slack_client() { next client }
+    request connection() { next client }
   }
   continuation(value = null)
 }
@@ -103,7 +105,7 @@ agent send_message(
   @"Files to upload as the message's attachments (`[]` for a plain text post)." files: array[file],
   @"The parent message's `ts` to reply in its thread; omit (or pass `null`) to post to the channel." thread_ts: string | null ?= null,
 ) -> null {
-  slack_send(client = get_slack_client(), channel = channel, text = text, thread_ts = thread_ts, files = files)
+  slack_send(client = connection(), channel = channel, text = text, thread_ts = thread_ts, files = files)
 }
 
 @"Tool: post files (images, documents) to a Slack channel, with a caption. Use the channel id given in
@@ -125,6 +127,6 @@ event whose acknowledgement was lost, and no dedup memory is kept here."
 agent watch_messages[effect E](
   @"The id of the channel to listen on (e.g. \"C0123456789\")." channel: string,
   @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, user: string, text: string, thread_ts: string | null, files: array[file]) -> null with E,
-) -> never with E | get_slack_client | io {
-  slack_watch(client = get_slack_client(), channel = channel, deliver_to = deliver_to)
+) -> never with E | connection | io {
+  slack_watch(client = connection(), channel = channel, deliver_to = deliver_to)
 }
