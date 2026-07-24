@@ -19,6 +19,12 @@ function property(value: unknown, key: string): unknown {
   return typeof value === "object" && value !== null ? Reflect.get(value, key) : undefined;
 }
 
+/** The values of an unknown object (or the elements of an array) as `unknown[]`, empty for anything
+ *  else — for walking an untyped JSON structure without asserting its shape. */
+function objectValues(value: unknown): unknown[] {
+  return typeof value === "object" && value !== null ? Object.values(value) : [];
+}
+
 /** Slack error codes that mean the credential itself is unusable — the operator must fix the token or
  *  scopes; the bot cannot recover on its own. Everything else is classified as a (usually transient or
  *  per-message) `api_error`. */
@@ -86,6 +92,28 @@ function attachmentName(contentType: string | undefined, index: number): string 
   return `file-${index + 1}.${extension}`;
 }
 
+/** The `ts` of the message a `files.uploadV2` shared into its channel — the seam a later thread-reply
+ *  addresses the upload by, symmetric with a plain post's own `ts`. `uploadV2` returns
+ *  `{ ok, files: [ completeUploadExternal-response, … ] }`, and a File shared into a channel records
+ *  the share's message `ts` under `shares.public` (or `shares.private` for a private channel), keyed by
+ *  channel id. Best-effort: `undefined` when Slack reports no share (a silent upload, an unexpected
+ *  response shape), which the caller renders as `""`. */
+function firstShareTs(response: unknown): string | undefined {
+  for (const job of objectValues(property(response, "files"))) {
+    for (const fileEntry of objectValues(property(job, "files"))) {
+      const shares = property(fileEntry, "shares");
+      for (const visibility of ["public", "private"]) {
+        for (const channelShares of objectValues(property(shares, visibility))) {
+          const shareList: unknown[] = Array.isArray(channelShares) ? channelShares : [];
+          const ts = property(shareList[0], "ts");
+          if (typeof ts === "string" && ts.length > 0) return ts;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
 /** What this sidecar reads out of a Socket Mode `message` envelope (the SDK emits it untyped). Every
  *  field is optional because the events API varies by subtype; the listener filters to the shapes it
  *  understands before delivering. */
@@ -99,6 +127,39 @@ interface MessageEnvelope {
     bot_id?: string;
     files?: Array<{ url_private_download?: string; url_private?: string; mimetype?: string }>;
   };
+}
+
+/** The minimal Block Kit shapes this sidecar posts for `ask`. The Web API types the `blocks` argument
+ *  as an open union whose base member is `{ type: string }`, so these structural literals satisfy it
+ *  without importing the (transitive, un-hoisted) `@slack/types` package. */
+interface TextObject {
+  type: "plain_text" | "mrkdwn";
+  text: string;
+}
+interface SectionBlock {
+  type: "section";
+  text: TextObject;
+}
+interface ButtonElement {
+  type: "button";
+  text: TextObject;
+  action_id: string;
+}
+interface ActionsBlock {
+  type: "actions";
+  elements: ButtonElement[];
+}
+type MessageBlock = SectionBlock | ActionsBlock;
+
+/** What this sidecar reads out of a Socket Mode `interactive` envelope's payload for `ask`: a
+ *  `block_actions` from a button click. Every field is optional because the SDK emits it untyped; the
+ *  listener filters to the click it is waiting for (matched by the prompt message's `ts`) before use. */
+interface BlockActionsPayload {
+  type?: string;
+  channel?: { id?: string };
+  message?: { ts?: string };
+  user?: { id?: string };
+  actions?: Array<{ action_id?: string }>;
 }
 
 katari.agent<{ bot_token: string; app_token: string }>(
@@ -159,12 +220,14 @@ katari.agent<{
   const connection = connectionOf(client);
   try {
     if (files.length === 0) {
-      await connection.web.chat.postMessage({
+      const response = await connection.web.chat.postMessage({
         channel,
         text,
         ...(thread_ts === null ? {} : { thread_ts }),
       });
-      return null;
+      // The posted message's `ts` — the seam a later thread-reply / edit addresses it by. A successful
+      // post always carries one; `?? ""` only guards the type.
+      return response.ts ?? "";
     }
     // Each file's bytes come over the blob side channel; Slack's upload wants a Buffer + a filename. The
     // slim handle carries no metadata, so the MIME type rides in with the same download. `uploadV2`
@@ -177,28 +240,103 @@ katari.agent<{
     );
     // The two calls differ only in `thread_ts`, but the SDK types the thread destination as requiring
     // it and the channel destination as forbidding it, so the branch keeps both object literals honest.
+    // `uploadV2` returns the file shares rather than a message, so the share's `ts` is dug out for the
+    // same thread-reply seam the plain-post path returns.
     if (thread_ts === null) {
-      await connection.web.files.uploadV2({
+      const response = await connection.web.files.uploadV2({
         channel_id: channel,
         ...(text === "" ? {} : { initial_comment: text }),
         file_uploads: uploads,
       });
-    } else {
-      await connection.web.files.uploadV2({
-        channel_id: channel,
-        thread_ts,
-        ...(text === "" ? {} : { initial_comment: text }),
-        file_uploads: uploads,
-      });
+      return firstShareTs(response) ?? "";
     }
-    return null;
+    const response = await connection.web.files.uploadV2({
+      channel_id: channel,
+      thread_ts,
+      ...(text === "" ? {} : { initial_comment: text }),
+      file_uploads: uploads,
+    });
+    return firstShareTs(response) ?? "";
   } catch (error) {
     // Raise the execution failure as the declared `prelude.throw[slack_error]`, classified auth vs api
     // (qualified constructor name — the boundary checks the tag against the schema const), so the
     // caller can catch it instead of the run panicking.
     katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
+    // `katari.throw` never returns; the rethrow only satisfies the declared return type.
+    throw error;
   }
 });
+
+katari.agent<{ client: string; channel: string; prompt: string; options: string[] }>(
+  "slack_ask",
+  async ({ client, channel, prompt, options }, context) => {
+    const connection = connectionOf(client);
+    let postedTs: string;
+    try {
+      // One button per option; the action_id is the option INDEX so the label itself (which Slack caps
+      // at 75 characters in a button) never has to round-trip as an identifier. The section block
+      // renders the prompt in the message body (a message with blocks shows `text` only as the
+      // notification / fallback).
+      const blocks: MessageBlock[] = [
+        { type: "section", text: { type: "mrkdwn", text: prompt } },
+        {
+          type: "actions",
+          elements: options.map((label, index) => ({
+            type: "button",
+            text: { type: "plain_text", text: label },
+            action_id: String(index),
+          })),
+        },
+      ];
+      const posted = await connection.web.chat.postMessage({ channel, text: prompt, blocks });
+      if (posted.ts === undefined) {
+        // A successful post always carries a ts; without it a click cannot be correlated, so fail the
+        // call rather than wait forever on an unidentifiable message.
+        throw new Error("slack chat.postMessage returned no message ts");
+      }
+      postedTs = posted.ts;
+    } catch (error) {
+      // Posting the prompt is the Slack API call that can fail; classify and raise it as the declared
+      // `slack_error` exactly as slack_send does.
+      katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
+      // `katari.throw` never returns; the rethrow only satisfies definite assignment on `postedTs`.
+      throw error;
+    }
+    // The wait: the FIRST button click on this prompt answers it. No time limit — the decision may land
+    // hours later; a runtime restart interrupts the external call under the at-most-once rule. The
+    // click's envelope is already acknowledged by the global `slack_event` handler installed at connect
+    // (an empty ack, which is exactly what a `block_actions` interaction needs), so there is nothing to
+    // ack here — this listener only reads the click and settles.
+    return new Promise<string>((resolve, reject) => {
+      const listener = (interactiveEvent: { body: BlockActionsPayload }) => {
+        const payload = interactiveEvent.body;
+        // Only a button click on THIS prompt: filter by the posted message's ts, so two asks open in the
+        // same channel never cross-answer (each interaction carries its own message's ts).
+        if (payload.type !== "block_actions" || payload.message?.ts !== postedTs) return;
+        cleanup();
+        void (async () => {
+          const actionId = payload.actions?.[0]?.action_id;
+          const chosen = options[Number(actionId)] ?? actionId ?? "";
+          const answeredBy = payload.user?.id === undefined ? "" : ` (by <@${payload.user.id}>)`;
+          const outcome = `${prompt}\n→ ${chosen}${answeredBy}`;
+          // Strip the buttons and show the outcome, so the channel keeps a readable record and a second
+          // click has nothing to press.
+          const resolvedBlocks: MessageBlock[] = [{ type: "section", text: { type: "mrkdwn", text: outcome } }];
+          await connection.web.chat.update({ channel, ts: postedTs, text: outcome, blocks: resolvedBlocks });
+          resolve(chosen);
+        })().catch((error) => reject(error instanceof Error ? error : new Error(String(error))));
+      };
+      const cleanup = () => connection.socket.off("interactive", listener);
+      connection.socket.on("interactive", listener);
+      // The runtime cancelled the call (run cancel / teardown): stop listening and settle. The stale
+      // buttons stay in the channel; a later click is acked by the global handler but answers nothing.
+      context.signal.addEventListener("abort", () => {
+        cleanup();
+        reject(new Error("slack ask cancelled"));
+      });
+    });
+  },
+);
 
 katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
   "slack_watch",
@@ -214,7 +352,7 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
         if (message.channel !== channel || message.user === undefined) return;
         if (message.bot_id !== undefined) return;
         if (message.subtype !== undefined && message.subtype !== "file_share") return;
-        const user = message.user;
+        const author = message.user;
         const messageChannel = message.channel;
         // Deliver back into the runtime as an inner delegation; the callback's effects escalate
         // through this call to the app's handlers. Attachments download from Slack's file URL (the
@@ -238,7 +376,7 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
           }
           await deliver_to.call({
             channel: messageChannel,
-            user,
+            author,
             text: message.text ?? "",
             thread_ts: message.thread_ts ?? null,
             files,

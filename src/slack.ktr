@@ -75,58 +75,116 @@ data api_error(message: string)
 type slack_error = auth_error | api_error
 
 @"Low-level: post to a channel on a given client — a thread reply when @thread_ts@ carries a `ts`, a
-channel post when it is `null`; any files upload as attachments. Raises `auth_error` or `api_error`
-(`slack_error`) when the Slack API call fails. Prefer the send_message agent."
+channel post when it is `null`; any files upload as attachments — returning the posted message's `ts`
+(a plain post's own `ts`, a file upload's share `ts`, or `\"\"` when Slack reports none). Raises
+`auth_error` or `api_error` (`slack_error`) when the Slack API call fails. Prefer the send_message agent."
 external agent slack_send(
   @"The opaque handle `create_slack_client` returned." client: string,
   @"The id of the channel to post in (e.g. \"C0123456789\")." channel: string,
   @"The message text (Slack mrkdwn); with files it becomes their caption." text: string,
   @"The parent message's `ts` to reply in its thread, or `null` to post to the channel." thread_ts: string | null,
   @"Files to upload as the message's attachments (`[]` for a plain text post)." files: array[file],
-) -> null with prelude.throw[slack_error]
+) -> string with prelude.throw[slack_error]
 
-@"Low-level: listen on a channel and deliver each incoming message (channel / user / text / thread_ts /
+@"Post @prompt@ with one Block Kit BUTTON per option to a channel and BLOCK until someone there clicks
+one, returning the clicked label verbatim — the built-in human-approval UI (an `ai.authorize_monitor`
+provider asking an operators' channel, a confirmation step before an irreversible action). Put the
+prompt in a channel whose MEMBERSHIP is the trust boundary: any member may click. The wait rides one
+external call, so a runtime restart while it is open interrupts it under the at-most-once rule (a
+catchable panic) and the posted buttons go stale. That failure is the DESIGNED outcome, not a defect
+to absorb here: let the panic ride to your supervisor and restart the asking flow — whoever wanted the
+answer asks again — rather than guessing an answer for a click that never landed. Raises `slack_error`
+when the post fails."
+agent ask(
+  @"The id of the channel to ask in — its membership is who may answer." channel: string,
+  @"The question posted above the buttons." prompt: string,
+  @"One button label per option; the clicked label is returned." options: array[string],
+) -> string {
+  slack_ask(client = connection(), channel = channel, prompt = prompt, options = options)
+}
+
+@"Low-level: post a Block Kit button prompt on a given client and await the click. Prefer the ask agent."
+external agent slack_ask(
+  @"The opaque handle `create_slack_client` returned." client: string,
+  @"The id of the channel to ask in." channel: string,
+  @"The question posted above the buttons." prompt: string,
+  @"One button label per option." options: array[string],
+) -> string with prelude.throw[slack_error]
+
+@"Low-level: listen on a channel and deliver each incoming message (channel / author / text / thread_ts /
 attachments as files) to a callback. Prefer the watch_messages agent."
 external agent slack_watch[effect E](
   @"The opaque handle `create_slack_client` returned." client: string,
   @"The id of the channel to listen on; messages elsewhere are ignored." channel: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, user: string, text: string, thread_ts: string | null, files: array[file]) -> null with E,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, author: string, text: string, thread_ts: string | null, files: array[file]) -> null with E,
 ) -> never with E
 
-@"Post a message to a channel using the ambient Slack client. Pass a message's `ts` as @thread_ts@ to
+@"Post a message to a channel using the ambient Slack client, returning the posted MESSAGE'S `ts` — the
+composable seam a later edit / thread-reply agent will address a message by, so a caller that needs to
+refer back keeps it (and one that does not simply drops it). Pass a message's `ts` as @thread_ts@ to
 reply in its thread (an incoming message's @thread_ts@ passed straight back replies where it came
-from); @files@ upload as attachments (pass `[]` for a plain text post — parameter defaults only take
-literals, so the empty array cannot default). Raises `slack_error` (`auth_error` | `api_error`) when the
-send fails — catch `api_error` to keep a bot serving past a transient failure, and let `auth_error`
-surface so a bad token stops the bot loudly."
+from); @files@ upload as attachments and default to none. Raises `slack_error` (`auth_error` |
+`api_error`) when the send fails — catch `api_error` to keep a bot serving past a transient failure, and
+let `auth_error` surface so a bad token stops the bot loudly."
 agent send_message(
   @"The id of the channel to post in (e.g. \"C0123456789\")." channel: string,
   @"The message text (Slack mrkdwn); with files it becomes their caption." text: string,
-  @"Files to upload as the message's attachments (`[]` for a plain text post)." files: array[file],
+  @"Files to upload as the message's attachments; defaults to none." files: array[file] ?= [],
   @"The parent message's `ts` to reply in its thread; omit (or pass `null`) to post to the channel." thread_ts: string | null ?= null,
-) -> null {
+) -> string {
   slack_send(client = connection(), channel = channel, text = text, thread_ts = thread_ts, files = files)
 }
 
-@"Tool: post files (images, documents) to a Slack channel, with a caption. Use the channel id given in
-the conversation context; pass each file as its handle object — a bare {\"$katari_ref\": \"<id>\"} suffices."
+@"Post RESILIENTLY, fire-and-forget — the composition every long-lived bot writes around
+`send_message`, packaged: a blank @text@ with no @files@ posts nothing (a quiet protocol's silence);
+a transient `api_error` (a rate limit, a channel the bot is not in) drops just this post so the bot
+keeps serving; `auth_error` re-raises so a bad token still stops the bot loudly. The posted message's
+`ts` is deliberately dropped — a caller that needs it wants `send_message` and its own error policy."
+agent try_send(
+  @"The id of the channel to post in (e.g. \"C0123456789\")." channel: string,
+  @"The message text; blank with no files posts nothing." text: string,
+  @"Files to upload as attachments; defaults to none." files: array[file] ?= [],
+  @"The parent message's `ts` to reply in its thread; omit (or pass `null`) to post to the channel." thread_ts: string | null ?= null,
+) -> null {
+  if (string.is_blank(value = text) && array.length(target = files) == 0) {
+    null
+  } else {
+    use handler {
+      request prelude.throw(error: slack_error) -> never {
+        match (error) {
+          case api_error(message => _) -> { break null }
+          // The residual is exactly `auth_error` — rethrown as bound, no reconstruction.
+          case rest -> { prelude.throw(error = rest) }
+        }
+      }
+    }
+    let _message_ts = send_message(channel = channel, text = text, files = files, thread_ts = thread_ts)
+    null
+  }
+}
+
+@"Tool: post files (images, documents) to a Slack channel, with a caption; returns the posted message's
+`ts`. Use the channel id given in the conversation context; pass each file as its handle object — a bare
+{\"$katari_ref\": \"<id>\"} suffices."
 agent send_files(
   @"The id of the channel to post in, from the conversation context." channel: string,
   @"The files to upload, each passed as its handle object." files: array[file],
   @"The text posted alongside the files." caption: string,
-) -> null {
+) -> string {
   send_message(channel = channel, text = caption, files = files)
 }
 
 @"Serve a channel forever, delivering each incoming message to @deliver_to@ — shaped like
 `time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. The bot's own posts (and other
-bots') are not delivered, so replying from @deliver_to@ cannot loop. A delivered @thread_ts@ is the
-thread the message was posted in, or `null` for a top-level message — pass it straight to
-`send_message` to reply where the message came from. Delivery is at-least-once: Slack re-sends an
-event whose acknowledgement was lost, and no dedup memory is kept here."
+bots') are not delivered, so replying from @deliver_to@ cannot loop. @author@ is the sender's raw Slack
+user id (an opaque `U…` id, not a name); hash it (`crypto.sha256`) before letting it leave the program,
+e.g. as an AI provider's abuse-attribution tag. A delivered @thread_ts@ is the thread the message was
+posted in, or `null` for a top-level message — pass it straight to `send_message` to reply where the
+message came from. Delivery is at-least-once: Slack re-sends an event whose acknowledgement was lost,
+and no dedup memory is kept here."
 agent watch_messages[effect E](
   @"The id of the channel to listen on (e.g. \"C0123456789\")." channel: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, user: string, text: string, thread_ts: string | null, files: array[file]) -> null with E,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, author: string, text: string, thread_ts: string | null, files: array[file]) -> null with E,
 ) -> never with E | connection | io {
   slack_watch(client = connection(), channel = channel, deliver_to = deliver_to)
 }
