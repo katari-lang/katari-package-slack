@@ -5,14 +5,20 @@ replies — threads and file attachments included — the Slack twin of the Disc
 means **no public URL and no request-signature verification**: the sidecar opens an outbound WebSocket
 with the app-level token and Slack pushes events over it, while the bot token drives the Web API.
 
-- `slack.provider(bot_token = ..., app_token = ...)` — connects ONCE and serves the client handle for
+- `slack.provider(bot_source = ..., app_source = ...)` — connects ONCE and serves the client handle for
   the extent of the continuation.
 - `slack.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
-  message (`channel` / `user` / `text` / `thread_ts` / `files`) to your agent. Bot posts (this bot's
+  message (`channel` / `author` / `text` / `thread_ts` / `files`) to your agent. Bot posts (this bot's
   own replies included) are not delivered, so replying cannot loop.
-- `slack.send_message(channel, text, files, thread_ts ?= null)` — post to a channel; a message's `ts`
-  as `thread_ts` replies in its thread, and `files` upload as attachments.
-- `slack.send_files(channel, files, caption)` — the tool shape of the above, for handing to a model.
+- `slack.send_message(channel, text, files ?= [], thread_ts ?= null)` — post to a channel, returning
+  the posted message's `ts`; a message's `ts` as `thread_ts` replies in its thread, and `files` upload
+  as attachments.
+- `slack.try_send(channel, text, files ?= [], thread_ts ?= null)` — the resilient wrapper every bot
+  writes: a blank text with no files posts nothing, a transient `api_error` drops just this post, and
+  `auth_error` still re-raises.
+- `slack.ask(channel, prompt, options)` — post a Block Kit button prompt and BLOCK until a member of
+  the channel clicks, returning the clicked label. The channel's membership is the trust boundary.
+- `slack.send_files(channel, files, caption)` — the tool shape of `send_message`, for handing to a model.
 
 Files are first-class on **both** directions: an incoming message's attachments arrive as `file`
 values (downloaded with the bot token, since Slack file URLs are private), and outgoing `file` values
@@ -36,9 +42,11 @@ no dedup memory is kept here.
 4. **Events**: Features → Event Subscriptions → enable, then under "Subscribe to bot events" add the
    message events for the conversations you watch: `message.channels` (public channels),
    `message.groups` (private channels), `message.im` (DMs). Socket Mode needs no Request URL.
-5. Install the app to your workspace: OAuth & Permissions → Install. The Bot User OAuth Token is the
+5. **Interactivity** (only for `slack.ask`): Features → Interactivity & Shortcuts → toggle on. Socket
+   Mode delivers the button clicks over the same WebSocket, so no Request URL is needed here either.
+6. Install the app to your workspace: OAuth & Permissions → Install. The Bot User OAuth Token is the
    `xoxb-…` token (`SLACK_BOT_TOKEN`).
-6. Invite the bot to the channel (`/invite @your-bot`) and copy the channel id (the `C…` value in the
+7. Invite the bot to the channel (`/invite @your-bot`) and copy the channel id (the `C…` value in the
    channel's details).
 
 ## Secrets / env
@@ -62,14 +70,14 @@ can bundle the sidecar. (A pure-Katari consumer that never applies this package 
 import slack
 
 // Echo every message back where it came from (its thread if it had one), attachments included.
-agent echo(channel: string, user: string, text: string, thread_ts: string | null, files: array[file]) -> null {
-  slack.send_message(channel = channel, text = f"<@${user}> said: ${text}", files = files, thread_ts = thread_ts)
+agent echo(channel: string, author: string, text: string, thread_ts: string | null, files: array[file]) -> null {
+  slack.try_send(channel = channel, text = f"<@${author}> said: ${text}", files = files, thread_ts = thread_ts)
 }
 
 agent main() -> never {
   use slack.provider(
-    bot_token = env.get_secret(key = "SLACK_BOT_TOKEN"),
-    app_token = env.get_secret(key = "SLACK_APP_TOKEN"),
+    bot_source = credentials.env(key = "SLACK_BOT_TOKEN"),
+    app_source = credentials.env(key = "SLACK_APP_TOKEN"),
   )
   slack.watch_messages(channel = "C0123456789", deliver_to = echo)
 }
