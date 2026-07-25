@@ -1,16 +1,23 @@
-// The Slack library: a Socket Mode connection capability plus the watch / send agents, the Slack twin
-// of the Discord package. The externals are implemented in `slack.ts` (the same module path, so they
-// register under `slack.*`). The one-line integration is the provider:
+// The Slack library: a Socket Mode connection capability plus the chat surface — the message plane
+// (`watch_messages` in, `send_message` / `try_send` out) and the interaction plane (`ask`). The
+// externals are implemented in `slack.ts` (the same module path, so they register under `slack.*`).
+// The one-line integration is the provider:
 // `use slack.provider(bot_source = credentials.env(key = "SLACK_BOT_TOKEN"), app_source = credentials.env(key = "SLACK_APP_TOKEN"))`.
 //
 // Socket Mode needs no public URL and no request-signature verification: the sidecar opens an outbound
 // WebSocket with the app-level token (`xapp-…`) and Slack pushes events over it, while the bot token
-// (`xoxb-…`) drives the Web API (posting, uploads, attachment downloads). Both tokens stay inside the
-// sidecar, keyed by the opaque client handle — they are never served as a value.
+// (`xoxb-…`) drives the Web API (posting, uploads, attachment downloads, dialogs). Both tokens stay
+// inside the sidecar, keyed by the opaque client handle — they are never served as a value.
 //
 // Files are first-class on both directions: an incoming message's attachments arrive as `file` values
 // (the sidecar downloads each from Slack's authenticated file URL and uploads it over the blob side
 // channel), and `send_message` posts `file` values back as Slack uploads (`files.uploadV2`).
+//
+// This module is the Slack half of a TWIN CONTRACT with the `discord` package: the same data types
+// with the same fields, so a bot ports between them by swapping the import. Two divergences are
+// deliberate and documented where they appear: `message.thread` / `send_message`'s @thread_ts@ (Slack
+// addresses a thread by its parent's `ts`, which is also a message's identity) and the `slack_error`
+// classification (Slack's error strings rather than Discord's HTTP statuses).
 
 @"The live Slack connection (the Socket Mode and Web API clients live in the sidecar; the handle is
 opaque)."
@@ -65,14 +72,32 @@ dropping every reply."
 data auth_error(message: string)
 
 @"A Slack API call failed for a non-auth reason: a rate limit, a transient network fault, a channel the
-bot is not in, a message too long; @message@ carries Slack's error string. Usually per-message or
-transient, so a bot catches it to drop just that reply and keep serving."
+bot is not in, a message too long, a Block Kit payload over one of Slack's size caps; @message@ carries
+Slack's error string. Usually per-message or transient, so a bot catches it to drop just that reply and
+keep serving."
 data api_error(message: string)
 
-// A Slack send failure: an auth/authorization failure or a plain API failure. Raised as a
-// `prelude.throw` (never a panic — that would tear the whole run down), classified in the sidecar by
-// Slack's error code. (Type synonyms take no docs.)
+// A Slack failure: an auth/authorization failure or a plain API failure. Raised as a `prelude.throw`
+// (never a panic — that would tear the whole run down), classified in the sidecar by Slack's error
+// code. The Discord twin has the same two constructors, classified by HTTP status instead. (Type
+// synonyms take no docs.)
 type slack_error = auth_error | api_error
+
+// ─── the message plane ────────────────────────────────────────────────────────────────────────────
+
+@"One incoming message, as `watch_messages` delivers it. @author@ is the sender's raw Slack user id (an
+opaque `U…` id, not a name); tag it with `crypto.hmac_sha256` under a secret key before letting it leave
+the program, e.g. as an AI provider's abuse-attribution tag. @thread@ is the thread the message was
+posted in, or `null` for a top-level message — pass it straight back as `send_message`'s @thread_ts@ to
+reply where the message came from. (@thread@ is the Slack twin's one extra field: Discord has no `ts`
+that doubles as a thread address.)"
+data message(
+  @"The channel the message was posted in." channel: string,
+  @"The sender's raw Slack user id (`U…`)." author: string,
+  @"The message text as Slack delivered it (mrkdwn)." text: string,
+  @"The message's attachments, downloaded as `file` values." files: array[file],
+  @"The `ts` of the thread this message belongs to, or `null` for a top-level message." thread: string | null,
+)
 
 @"Low-level: post to a channel on a given client — a thread reply when @thread_ts@ carries a `ts`, a
 channel post when it is `null`; any files upload as attachments — returning the posted message's `ts`
@@ -86,46 +111,21 @@ external agent slack_send(
   @"Files to upload as the message's attachments (`[]` for a plain text post)." files: array[file],
 ) -> string with prelude.throw[slack_error]
 
-@"Post @prompt@ with one Block Kit BUTTON per option to a channel and BLOCK until someone there clicks
-one, returning the clicked label verbatim — the built-in human-approval UI (an `ai.authorize_monitor`
-provider asking an operators' channel, a confirmation step before an irreversible action). Put the
-prompt in a channel whose MEMBERSHIP is the trust boundary: any member may click. The wait rides one
-external call, so a runtime restart while it is open interrupts it under the at-most-once rule (a
-catchable panic) and the posted buttons go stale. That failure is the DESIGNED outcome, not a defect
-to absorb here: let the panic ride to your supervisor and restart the asking flow — whoever wanted the
-answer asks again — rather than guessing an answer for a click that never landed. Raises `slack_error`
-when the post fails."
-agent ask(
-  @"The id of the channel to ask in — its membership is who may answer." channel: string,
-  @"The question posted above the buttons." prompt: string,
-  @"One button label per option; the clicked label is returned." options: array[string],
-) -> string {
-  slack_ask(client = connection(), channel = channel, prompt = prompt, options = options)
-}
-
-@"Low-level: post a Block Kit button prompt on a given client and await the click. Prefer the ask agent."
-external agent slack_ask(
-  @"The opaque handle `create_slack_client` returned." client: string,
-  @"The id of the channel to ask in." channel: string,
-  @"The question posted above the buttons." prompt: string,
-  @"One button label per option." options: array[string],
-) -> string with prelude.throw[slack_error]
-
-@"Low-level: listen on a channel and deliver each incoming message (channel / author / text / thread_ts /
-attachments as files) to a callback. Prefer the watch_messages agent."
+@"Low-level: listen on a channel and deliver each incoming message to a callback. Prefer the
+watch_messages agent."
 external agent slack_watch[effect E](
   @"The opaque handle `create_slack_client` returned." client: string,
   @"The id of the channel to listen on; messages elsewhere are ignored." channel: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, author: string, text: string, thread_ts: string | null, files: array[file]) -> null with E,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (message: message) -> null with E,
 ) -> never with E
 
 @"Post a message to a channel using the ambient Slack client, returning the posted MESSAGE'S `ts` — the
 composable seam a later edit / thread-reply agent will address a message by, so a caller that needs to
 refer back keeps it (and one that does not simply drops it). Pass a message's `ts` as @thread_ts@ to
-reply in its thread (an incoming message's @thread_ts@ passed straight back replies where it came
-from); @files@ upload as attachments and default to none. Raises `slack_error` (`auth_error` |
-`api_error`) when the send fails — catch `api_error` to keep a bot serving past a transient failure, and
-let `auth_error` surface so a bad token stops the bot loudly."
+reply in its thread (a delivered `message.thread` passed straight back replies where it came from);
+@files@ upload as attachments and default to none. Raises `slack_error` (`auth_error` | `api_error`)
+when the send fails — catch `api_error` to keep a bot serving past a transient failure, and let
+`auth_error` surface so a bad token stops the bot loudly."
 agent send_message(
   @"The id of the channel to post in (e.g. \"C0123456789\")." channel: string,
   @"The message text (Slack mrkdwn); with files it becomes their caption." text: string,
@@ -174,17 +174,132 @@ agent send_files(
   send_message(channel = channel, text = caption, files = files)
 }
 
-@"Serve a channel forever, delivering each incoming message to @deliver_to@ — shaped like
-`time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. The bot's own posts (and other
-bots') are not delivered, so replying from @deliver_to@ cannot loop. @author@ is the sender's raw Slack
-user id (an opaque `U…` id, not a name); hash it (`crypto.sha256`) before letting it leave the program,
-e.g. as an AI provider's abuse-attribution tag. A delivered @thread_ts@ is the thread the message was
-posted in, or `null` for a top-level message — pass it straight to `send_message` to reply where the
-message came from. Delivery is at-least-once: Slack re-sends an event whose acknowledgement was lost,
-and no dedup memory is kept here."
+@"Serve a channel forever, delivering each incoming `message` to @deliver_to@ — shaped like
+`time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. The bot's own posts (and
+other bots') are not delivered, so replying from @deliver_to@ cannot loop. Delivery is at-least-once:
+Slack re-sends an event whose acknowledgement was lost, and no dedup memory is kept here."
 agent watch_messages[effect E](
   @"The id of the channel to listen on (e.g. \"C0123456789\")." channel: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (channel: string, author: string, text: string, thread_ts: string | null, files: array[file]) -> null with E,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (message: message) -> null with E,
 ) -> never with E | connection | io {
   slack_watch(client = connection(), channel = channel, deliver_to = deliver_to)
 }
+
+// ─── the interaction plane ────────────────────────────────────────────────────────────────────────
+
+@"A pressable BUTTON. @label@ is what the channel reads; @id@ is what comes back on `clicked`, so a
+program branches on the key it chose and never on display text. Slack caps a button's label at 75
+characters — an over-cap control is rejected by the platform as `api_error`."
+data button(
+  @"The stable key this control answers with; matched as `clicked`'s @id@." id: string,
+  @"The button's visible text (≤75 characters)." label: string,
+)
+
+@"A DROPDOWN of fixed options: choosing one answers the ask with `chose`, carrying the option's text
+verbatim (so a program may match the option itself — the options are its own strings). Slack caps the
+placeholder and each option at 75 characters."
+data select(
+  @"The stable key this control answers with; matched as `chose`'s @id@." id: string,
+  @"The dropdown's placeholder text, shown before anything is chosen (≤75 characters)." label: string,
+  @"The options offered; the chosen one comes back verbatim (each ≤75 characters)." options: array[string],
+)
+
+@"One text input inside a `form`. @value@ is a PREFILL, which is what makes DRAFT EDITING an ordinary
+`ask`: ship the draft as @value@ and the human edits it in place. Every field must be filled — Slack's
+own client refuses an empty input, and that is the only validation there is (see `ask`)."
+data field(
+  @"The key this field's text is stored under in `submitted`'s @values@." id: string,
+  @"The label shown above the input." label: string,
+  @"The text the input opens with — a prefill the human edits. Defaults to an empty input." value: string ?= "",
+  @"A multi-line textarea instead of a single line. Defaults to single-line." multiline: boolean ?= false,
+)
+
+@"A FORM: a button in the channel that opens a DIALOG of text inputs, answering the ask with
+`submitted` once the human submits it. This is how free text is collected — a one-field form asks an
+open question, a prefilled multi-field form reviews a draft. @title@ is capped at 24 characters, the
+tighter of the two platforms' caps, so a twin program ports unchanged."
+data form(
+  @"The stable key this control answers with; matched as `submitted`'s @id@." id: string,
+  @"The visible text of the button that OPENS the dialog (≤75 characters)." label: string,
+  @"The dialog's own heading (≤24 characters)." title: string,
+  @"The inputs the dialog collects, in order." fields: array[field],
+)
+
+// One control offered under an `ask`'s prompt. The three shapes are the three ways a human answers —
+// press, choose, write — and each has exactly one matching `answer` constructor. (Type synonyms take
+// no docs.)
+type control = button | select | form
+
+@"A `button` was pressed: @id@ is that button's own id, @by@ the Slack user id of whoever pressed it."
+data clicked(
+  @"The `button`'s @id@." id: string,
+  @"The answerer's raw Slack user id (`U…`)." by: string,
+)
+
+@"A `select`'s option was chosen: @id@ is that select's own id and @option@ the chosen text verbatim."
+data chose(
+  @"The `select`'s @id@." id: string,
+  @"The chosen option, exactly as it was offered." option: string,
+  @"The answerer's raw Slack user id (`U…`)." by: string,
+)
+
+@"A `form` was submitted: @id@ is that form's own id and @values@ maps each `field`'s id to the text the
+human left in it (`record.get` reads one)."
+data submitted(
+  @"The `form`'s @id@." id: string,
+  @"Each `field`'s id to the text submitted for it." values: record[string],
+  @"The answerer's raw Slack user id (`U…`)." by: string,
+)
+
+// What an `ask` came back with: one constructor per `control` shape, so matching the answer is the same
+// dispatch as choosing the control. (Type synonyms take no docs.)
+type answer = clicked | chose | submitted
+
+@"Post @prompt@ with @controls@ under it and BLOCK until someone in the channel answers, returning the
+`answer` that control produced — the ONE interaction primitive, so the four human-in-the-loop shapes are
+four control lists rather than four agents: an APPROVAL is two `button`s, an OPEN QUESTION is a
+one-field `form`, a DRAFT REVIEW is a `form` whose `field` is prefilled with the draft (with a `button`
+beside it to reject), and a MULTIPLE CHOICE is a `select`. Every control is live at once and the FIRST
+answer settles the ask; the controls are then stripped from the message, so a second answer has nothing
+to press. Branch on the control's own id — `case clicked(id => \"approve\", by => _)` — never on display
+text.
+
+Post to a channel whose MEMBERSHIP is the trust boundary: any member may answer. @by@ is the answerer's
+raw Slack user id (an opaque `U…` id, not a name); tag it with `crypto.hmac_sha256` under a secret key
+before letting it leave the program.
+
+Opening a `form`'s dialog and closing it again is NOT an answer: nothing was submitted, so the question
+stays open and any control — that form again, or a sibling — can still answer it. A curious press cannot
+consume the ask.
+
+The ask holds NO time limit, deliberately: a deadline is `time.with_deadline` wrapped around it, and a
+withdrawal is `region.cancel_by_id` on the fiber holding it. One blocking question composes with both,
+whereas an expiry baked in here would make every caller handle a timeout it never asked for.
+
+A `form`'s inputs are NOT validated here. Slack's client requires each input to be non-empty and that is
+the whole of it: the socket acknowledges every interaction the instant it arrives — which is exactly what
+closes the dialog — so this package cannot answer a submission with per-field errors. Validate in the
+program and `ask` again.
+
+The wait rides one external call, so a runtime restart while it is open interrupts it under the
+at-most-once rule (a catchable panic) and the posted controls go stale. That failure is the DESIGNED
+outcome, not a defect to absorb here: let the panic ride to your supervisor and restart the asking flow —
+whoever wanted the answer asks again — rather than guessing an answer that never landed. Raises
+`slack_error` when the prompt cannot be posted, or when a `form`'s dialog cannot be opened (its
+three-second interaction token expired, a size cap exceeded); catch `api_error` to ask again."
+agent ask(
+  @"The id of the channel to ask in — its membership is who may answer." channel: string,
+  @"The question posted above the controls (Slack mrkdwn)." prompt: string,
+  @"What the human may answer with: `button` / `select` / `form` values, rendered in one row in order. Each control's @id@ must be DISTINCT within one ask — the id IS the correlation key Slack carries back, so a repeat would make two controls indistinguishable (Slack rejects the duplicate outright)." controls: array[control],
+) -> answer with connection | io | prelude.throw[slack_error] {
+  slack_ask(client = connection(), channel = channel, prompt = prompt, controls = controls)
+}
+
+@"Low-level: post a prompt with its controls on a given client and await the first answer. Prefer the
+ask agent."
+external agent slack_ask(
+  @"The opaque handle `create_slack_client` returned." client: string,
+  @"The id of the channel to ask in." channel: string,
+  @"The question posted above the controls." prompt: string,
+  @"The controls offered under the prompt." controls: array[control],
+) -> answer with prelude.throw[slack_error]

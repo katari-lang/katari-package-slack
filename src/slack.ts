@@ -8,9 +8,24 @@
 // channel and upload to Slack (`files.uploadV2`); an incoming message's attachments download from
 // Slack's authenticated file URL and upload over the same side channel, so the delivered message
 // carries real `file` values.
+//
+// The interaction plane (`slack_ask`) is a two-stage affair on Slack, because a dialog cannot be opened
+// out of the blue: a `form` control posts as a plain BUTTON, and the `block_actions` envelope that
+// button's press produces carries the three-second `trigger_id` that `views.open` needs. The dialog's
+// submission then arrives as a `view_submission` on the same `interactive` socket event, correlated back
+// to its ask by the prompt's `ts` in `private_metadata`.
 
 import { Buffer } from "node:buffer";
-import { katari, KatariData, type KatariAgent, type KatariFile } from "@katari-lang/port";
+import {
+  katari,
+  KatariData,
+  type KatariAgent,
+  type KatariFile,
+  type KatariRecord,
+  KatariString,
+  type KatariText,
+  type KatariValue,
+} from "@katari-lang/port";
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 
@@ -40,9 +55,9 @@ const SLACK_AUTH_CODES = new Set([
   "ekm_access_denied",
 ]);
 
-/** The Slack platform error code out of a failed Web API call (`chat.postMessage` / `files.uploadV2`
- *  reject with a `WebAPICallError` whose `data.error` is the code, e.g. "invalid_auth"), or undefined
- *  when the failure carries none (a transport fault). */
+/** The Slack platform error code out of a failed Web API call (`chat.postMessage` / `files.uploadV2` /
+ *  `views.open` reject with a `WebAPICallError` whose `data.error` is the code, e.g. "invalid_auth"), or
+ *  undefined when the failure carries none (a transport fault). */
 function slackErrorCode(error: unknown): string | undefined {
   const code = property(property(error, "data"), "error");
   return typeof code === "string" && code.length > 0 ? code : undefined;
@@ -58,7 +73,8 @@ function slackErrorMessage(error: unknown): string {
 }
 
 /** The qualified `slack_error` constructor for a failure: an unusable credential is `auth_error`,
- *  everything else (rate limit, transport, a per-channel refusal) is `api_error`. */
+ *  everything else (rate limit, transport, a per-channel refusal, a Block Kit payload over one of
+ *  Slack's size caps) is `api_error`. */
 function slackErrorConstructor(error: unknown): string {
   const code = slackErrorCode(error);
   return code !== undefined && SLACK_AUTH_CODES.has(code) ? "slack.auth_error" : "slack.api_error";
@@ -129,37 +145,366 @@ interface MessageEnvelope {
   };
 }
 
-/** The minimal Block Kit shapes this sidecar posts for `ask`. The Web API types the `blocks` argument
- *  as an open union whose base member is `{ type: string }`, so these structural literals satisfy it
- *  without importing the (transitive, un-hoisted) `@slack/types` package. */
-interface TextObject {
-  type: "plain_text" | "mrkdwn";
+// ─── reading the argument's data values ───────────────────────────────────────────────────────────
+
+/** A bare record, as a decoded `data` value's fields always are. A predicate rather than a cast, so the
+ *  narrowing is the compiler's. */
+function isRecord(value: unknown): value is KatariRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The fields of a `data` value in the argument. The katari-side type guarantees a data value here, so
+ *  the empty fallback exists only to satisfy the type — a well-typed call never takes it. */
+function dataFields(value: KatariValue): KatariRecord {
+  if (!(value instanceof KatariData)) return {};
+  return isRecord(value.value) ? value.value : {};
+}
+
+/** A katari `string` field, whether it arrived inline or blob-backed. Every string a control carries can
+ *  be large — a draft-editing form's prefill is exactly the case the runtime promotes out of line — so
+ *  none of them may be read as a plain JS string. */
+async function readText(value: KatariValue): Promise<string> {
+  if (typeof value === "string") return value;
+  if (value instanceof KatariString) return value.text();
+  return "";
+}
+
+/** A katari `array` field's elements. */
+function readArray(value: KatariValue): KatariValue[] {
+  return Array.isArray(value) ? value : [];
+}
+
+// ─── the interaction plane: controls in, one answer out ───────────────────────────────────────────
+
+/** One control an ask offered, read out of its `KatariData` — the shape both the Block Kit builder and
+ *  the answer matcher work from. The `id` is the action_id Slack echoes back, so it is the key an
+ *  interaction is resolved to its control by. */
+type Control = ButtonControl | SelectControl | FormControl;
+
+interface ButtonControl {
+  kind: "button";
+  id: string;
+  label: string;
+}
+interface SelectControl {
+  kind: "select";
+  id: string;
+  label: string;
+  options: string[];
+}
+interface FormControl {
+  kind: "form";
+  id: string;
+  label: string;
+  title: string;
+  fields: FormField[];
+}
+interface FormField {
+  id: string;
+  label: string;
+  value: string;
+  multiline: boolean;
+}
+
+async function readControl(control: KatariData<KatariRecord>): Promise<Control> {
+  const fields = control.value;
+  switch (control.name) {
+    case "slack.button":
+      return {
+        kind: "button",
+        id: await readText(fields.id),
+        label: await readText(fields.label),
+      };
+    case "slack.select":
+      return {
+        kind: "select",
+        id: await readText(fields.id),
+        label: await readText(fields.label),
+        options: await Promise.all(readArray(fields.options).map(readText)),
+      };
+    case "slack.form":
+      return {
+        kind: "form",
+        id: await readText(fields.id),
+        label: await readText(fields.label),
+        title: await readText(fields.title),
+        fields: await Promise.all(readArray(fields.fields).map(readFormField)),
+      };
+    default:
+      // `control` is a closed sum of exactly three constructors, so a fourth is a defect rather than a
+      // runtime condition: fail loudly instead of silently dropping a control a human would look for.
+      throw new Error(`unknown slack control: ${control.name}`);
+  }
+}
+
+async function readFormField(value: KatariValue): Promise<FormField> {
+  const fields = dataFields(value);
+  return {
+    id: await readText(fields.id),
+    label: await readText(fields.label),
+    value: await readText(fields.value),
+    multiline: fields.multiline === true,
+  };
+}
+
+/** The minimal Block Kit shapes this sidecar posts. The Web API types its `blocks` argument as an open
+ *  union whose base member is `{ type: string }`, so these structural literals satisfy it without
+ *  importing the (transitive, un-hoisted) `@slack/types` package. */
+interface PlainText {
+  type: "plain_text";
+  text: string;
+}
+interface Mrkdwn {
+  type: "mrkdwn";
   text: string;
 }
 interface SectionBlock {
   type: "section";
-  text: TextObject;
+  text: Mrkdwn;
 }
 interface ButtonElement {
   type: "button";
-  text: TextObject;
+  text: PlainText;
   action_id: string;
+}
+interface SelectElement {
+  type: "static_select";
+  action_id: string;
+  placeholder: PlainText;
+  options: Array<{ text: PlainText; value: string }>;
 }
 interface ActionsBlock {
   type: "actions";
-  elements: ButtonElement[];
+  elements: Array<ButtonElement | SelectElement>;
 }
 type MessageBlock = SectionBlock | ActionsBlock;
 
-/** What this sidecar reads out of a Socket Mode `interactive` envelope's payload for `ask`: a
- *  `block_actions` from a button click. Every field is optional because the SDK emits it untyped; the
- *  listener filters to the click it is waiting for (matched by the prompt message's `ts`) before use. */
-interface BlockActionsPayload {
+/** A dialog's input row: one `plain_text_input` under its label. `block_id` and `action_id` are both the
+ *  `field`'s own id, so the submission's state map is keyed by exactly what the katari side declared. */
+interface InputBlock {
+  type: "input";
+  block_id: string;
+  label: PlainText;
+  element: {
+    type: "plain_text_input";
+    action_id: string;
+    multiline: boolean;
+    initial_value?: string;
+  };
+}
+
+/** The modal a `form` opens. `submit` is required whenever the view carries an input block. */
+interface ModalView {
+  type: "modal";
+  callback_id: string;
+  private_metadata: string;
+  title: PlainText;
+  submit: PlainText;
+  close: PlainText;
+  blocks: InputBlock[];
+}
+
+/** What this sidecar reads out of a Socket Mode `interactive` envelope's payload: a `block_actions` from
+ *  a press or a choice, and a `view_submission` from a submitted dialog. Every field is optional because
+ *  the SDK emits it untyped; the listener filters to the ask it is waiting for before use. */
+interface InteractionPayload {
   type?: string;
-  channel?: { id?: string };
-  message?: { ts?: string };
+  trigger_id?: string;
   user?: { id?: string };
-  actions?: Array<{ action_id?: string }>;
+  message?: { ts?: string };
+  actions?: Array<{ action_id?: string; selected_option?: { value?: string } }>;
+  view?: {
+    callback_id?: string;
+    private_metadata?: string;
+    state?: { values?: { [blockId: string]: { [actionId: string]: { value?: string | null } } } };
+  };
+}
+
+/** The prompt message: the question, then every control in one actions row. */
+function promptBlocks(prompt: string, controls: Control[]): MessageBlock[] {
+  const blocks: MessageBlock[] = [{ type: "section", text: { type: "mrkdwn", text: prompt } }];
+  const elements = controls.map(controlElement);
+  // An actions block must carry at least one element, so an ask offering no controls posts as plain text
+  // (and then waits forever — which is what asking with no way to answer means).
+  if (elements.length > 0) blocks.push({ type: "actions", elements });
+  return blocks;
+}
+
+function controlElement(control: Control): ButtonElement | SelectElement {
+  switch (control.kind) {
+    case "select":
+      return {
+        type: "static_select",
+        action_id: control.id,
+        placeholder: { type: "plain_text", text: control.label },
+        options: control.options.map((option) => ({
+          text: { type: "plain_text", text: option },
+          value: option,
+        })),
+      };
+    // A form's channel-side control is an ordinary button: pressing it is the only way to mint the
+    // interaction token its dialog opens with.
+    case "button":
+    case "form":
+      return {
+        type: "button",
+        text: { type: "plain_text", text: control.label },
+        action_id: control.id,
+      };
+  }
+}
+
+function modalView(control: FormControl, askTs: string): ModalView {
+  return {
+    type: "modal",
+    // The two halves of the correlation, both authored here and echoed back verbatim on the submission:
+    // `callback_id` says WHICH form was submitted, `private_metadata` says which ASK is waiting for it.
+    // The pair is what lets several asks — each with several forms — be open in one channel at once.
+    callback_id: control.id,
+    private_metadata: askTs,
+    title: { type: "plain_text", text: control.title },
+    submit: { type: "plain_text", text: "Submit" },
+    close: { type: "plain_text", text: "Cancel" },
+    blocks: control.fields.map(
+      (field): InputBlock => ({
+        type: "input",
+        block_id: field.id,
+        label: { type: "plain_text", text: field.label },
+        element: {
+          type: "plain_text_input",
+          action_id: field.id,
+          multiline: field.multiline,
+          // An empty prefill is omitted rather than sent as "": the rendered input is the same either
+          // way, and omitting keeps the payload the shape Slack's reference describes.
+          ...(field.value === "" ? {} : { initial_value: field.value }),
+        },
+      }),
+    ),
+  };
+}
+
+/** A submitted dialog's inputs, keyed by ACTION id — the `field`'s own id. Slack may substitute its own
+ *  `block_id`s, so the action id is the only key the katari side can rely on. */
+function submittedValues(view: NonNullable<InteractionPayload["view"]>): Record<string, string> {
+  const submitted: Record<string, string> = {};
+  for (const block of Object.values(view.state?.values ?? {})) {
+    for (const [actionId, element] of Object.entries(block)) {
+      submitted[actionId] = element.value ?? "";
+    }
+  }
+  return submitted;
+}
+
+/** The ask's own cancellation (a run cancel / teardown), kept distinct from a Slack failure so it is not
+ *  reclassified as a `slack_error` the program would try to catch. */
+class AskCancelled extends Error {
+  constructor() {
+    super("slack ask cancelled");
+    this.name = "AskCancelled";
+  }
+}
+
+/** One settled ask: the `answer` data value the katari side receives, and the one-line record left in
+ *  the channel once the controls come off. */
+interface Answered {
+  answer: KatariData;
+  receipt: string;
+}
+
+/** The " (by <@U…>)" suffix on the channel's record, empty when Slack reported no user. */
+function answeredBy(userId: string): string {
+  return userId === "" ? "" : ` (by <@${userId}>)`;
+}
+
+/** Wait for the first answer to the prompt at `askTs`. Presses and choices answer directly; a form's
+ *  press only opens its dialog, and the answer is the `view_submission` that follows. */
+function awaitAnswer(
+  connection: SlackConnection,
+  controls: Control[],
+  askTs: string,
+  signal: AbortSignal,
+): Promise<Answered> {
+  const offered = new Map(controls.map((control) => [control.id, control]));
+  return new Promise<Answered>((resolve, reject) => {
+    // An `abort` listener on an already-aborted signal never fires, so a call cancelled before the wait
+    // began has to settle here or it would hang forever.
+    if (signal.aborted) {
+      reject(new AskCancelled());
+      return;
+    }
+    const listener = (interactiveEvent: { body: InteractionPayload }) => {
+      const payload = interactiveEvent.body;
+      if (payload.type === "block_actions") {
+        // Only an interaction on THIS prompt: filtering by the posted message's ts is what keeps two
+        // asks open in the same channel from cross-answering.
+        if (payload.message?.ts !== askTs) return;
+        const action = payload.actions?.[0];
+        const control = action?.action_id === undefined ? undefined : offered.get(action.action_id);
+        if (action === undefined || control === undefined) return;
+        const by = payload.user?.id ?? "";
+        switch (control.kind) {
+          case "button":
+            settle({
+              answer: new KatariData("slack.clicked", { id: control.id, by }),
+              receipt: `${control.label}${answeredBy(by)}`,
+            });
+            return;
+          case "select": {
+            const option = action.selected_option?.value;
+            // A static select reports its choice inline; a payload without one is not an answer.
+            if (option === undefined) return;
+            settle({
+              answer: new KatariData("slack.chose", { id: control.id, option, by }),
+              receipt: `${control.label}: ${option}${answeredBy(by)}`,
+            });
+            return;
+          }
+          case "form": {
+            const triggerId = payload.trigger_id;
+            if (triggerId === undefined) {
+              fail(new Error("slack block_actions carried no trigger_id, so the form cannot open"));
+              return;
+            }
+            // The press is not the answer — it is the only source of the three-second interaction token
+            // a dialog opens with. Keep listening: the answer is this dialog's submission. A failed open
+            // fails the ask, because the human pressed and no answer can now arrive through that control.
+            void connection.web.views
+              .open({ trigger_id: triggerId, view: modalView(control, askTs) })
+              .catch(fail);
+            return;
+          }
+        }
+      }
+      const view = payload.view;
+      // A dialog was submitted. `private_metadata` carries the prompt's ts, so this is the same
+      // correlation the press used, handed through the dialog and back.
+      if (payload.type === "view_submission" && view !== undefined && view.private_metadata === askTs) {
+        const id = view.callback_id ?? "";
+        const by = payload.user?.id ?? "";
+        settle({
+          answer: new KatariData("slack.submitted", { id, values: submittedValues(view), by }),
+          receipt: `${offered.get(id)?.label ?? id} submitted${answeredBy(by)}`,
+        });
+      }
+    };
+    const cleanup = () => {
+      connection.socket.off("interactive", listener);
+      signal.removeEventListener("abort", abort);
+    };
+    const settle = (answered: Answered) => {
+      cleanup();
+      resolve(answered);
+    };
+    const fail = (error: unknown) => {
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    // The runtime cancelled the call (run cancel / teardown): stop listening and settle. The stale
+    // controls stay in the channel; a later press is acked by the global handler but answers nothing.
+    const abort = () => fail(new AskCancelled());
+    connection.socket.on("interactive", listener);
+    signal.addEventListener("abort", abort);
+  });
 }
 
 katari.agent<{ bot_token: string; app_token: string }>(
@@ -171,6 +516,11 @@ katari.agent<{ bot_token: string; app_token: string }>(
     // long, so acking from the delivery path would turn every slow handler into duplicates. A failed
     // ack (the socket dropped mid-reply) is deliberately ignored — Slack just re-sends the envelope,
     // which is the at-least-once contract the watch documents.
+    //
+    // The empty ack is also what an interaction needs: a `block_actions` wants nothing back, and an
+    // empty ack of a `view_submission` is exactly what CLOSES the submitted dialog. It is the reason a
+    // form's inputs cannot be rejected with per-field errors — the envelope is already answered by the
+    // time this package sees it, which `ask` documents as the contract.
     socket.on("slack_event", ({ ack }: { ack: () => Promise<void> }) => {
       void ack().catch(() => {});
     });
@@ -267,76 +617,61 @@ katari.agent<{
   }
 });
 
-katari.agent<{ client: string; channel: string; prompt: string; options: string[] }>(
-  "slack_ask",
-  async ({ client, channel, prompt, options }, context) => {
-    const connection = connectionOf(client);
-    let postedTs: string;
-    try {
-      // One button per option; the action_id is the option INDEX so the label itself (which Slack caps
-      // at 75 characters in a button) never has to round-trip as an identifier. The section block
-      // renders the prompt in the message body (a message with blocks shows `text` only as the
-      // notification / fallback).
-      const blocks: MessageBlock[] = [
-        { type: "section", text: { type: "mrkdwn", text: prompt } },
-        {
-          type: "actions",
-          elements: options.map((label, index) => ({
-            type: "button",
-            text: { type: "plain_text", text: label },
-            action_id: String(index),
-          })),
-        },
-      ];
-      const posted = await connection.web.chat.postMessage({ channel, text: prompt, blocks });
-      if (posted.ts === undefined) {
-        // A successful post always carries a ts; without it a click cannot be correlated, so fail the
-        // call rather than wait forever on an unidentifiable message.
-        throw new Error("slack chat.postMessage returned no message ts");
-      }
-      postedTs = posted.ts;
-    } catch (error) {
-      // Posting the prompt is the Slack API call that can fail; classify and raise it as the declared
-      // `slack_error` exactly as slack_send does.
-      katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
-      // `katari.throw` never returns; the rethrow only satisfies definite assignment on `postedTs`.
-      throw error;
-    }
-    // The wait: the FIRST button click on this prompt answers it. No time limit — the decision may land
-    // hours later; a runtime restart interrupts the external call under the at-most-once rule. The
-    // click's envelope is already acknowledged by the global `slack_event` handler installed at connect
-    // (an empty ack, which is exactly what a `block_actions` interaction needs), so there is nothing to
-    // ack here — this listener only reads the click and settles.
-    return new Promise<string>((resolve, reject) => {
-      const listener = (interactiveEvent: { body: BlockActionsPayload }) => {
-        const payload = interactiveEvent.body;
-        // Only a button click on THIS prompt: filter by the posted message's ts, so two asks open in the
-        // same channel never cross-answer (each interaction carries its own message's ts).
-        if (payload.type !== "block_actions" || payload.message?.ts !== postedTs) return;
-        cleanup();
-        void (async () => {
-          const actionId = payload.actions?.[0]?.action_id;
-          const chosen = options[Number(actionId)] ?? actionId ?? "";
-          const answeredBy = payload.user?.id === undefined ? "" : ` (by <@${payload.user.id}>)`;
-          const outcome = `${prompt}\n→ ${chosen}${answeredBy}`;
-          // Strip the buttons and show the outcome, so the channel keeps a readable record and a second
-          // click has nothing to press.
-          const resolvedBlocks: MessageBlock[] = [{ type: "section", text: { type: "mrkdwn", text: outcome } }];
-          await connection.web.chat.update({ channel, ts: postedTs, text: outcome, blocks: resolvedBlocks });
-          resolve(chosen);
-        })().catch((error) => reject(error instanceof Error ? error : new Error(String(error))));
-      };
-      const cleanup = () => connection.socket.off("interactive", listener);
-      connection.socket.on("interactive", listener);
-      // The runtime cancelled the call (run cancel / teardown): stop listening and settle. The stale
-      // buttons stay in the channel; a later click is acked by the global handler but answers nothing.
-      context.signal.addEventListener("abort", () => {
-        cleanup();
-        reject(new Error("slack ask cancelled"));
-      });
+katari.agent<{
+  client: string;
+  channel: string;
+  prompt: KatariText;
+  controls: Array<KatariData<KatariRecord>>;
+}>("slack_ask", async ({ client, channel, prompt, controls }, context) => {
+  const connection = connectionOf(client);
+  const question = typeof prompt === "string" ? prompt : await prompt.text();
+  const offered = await Promise.all(controls.map(readControl));
+  let askTs: string;
+  try {
+    const posted = await connection.web.chat.postMessage({
+      channel,
+      text: question,
+      blocks: promptBlocks(question, offered),
     });
-  },
-);
+    if (posted.ts === undefined) {
+      // A successful post always carries a ts; without it an answer cannot be correlated, so fail the
+      // call rather than wait forever on an unidentifiable prompt.
+      throw new Error("slack chat.postMessage returned no message ts");
+    }
+    askTs = posted.ts;
+  } catch (error) {
+    // Posting the prompt is the first Slack call that can fail; classify and raise it as the declared
+    // `slack_error` exactly as slack_send does.
+    katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
+    // `katari.throw` never returns; the rethrow only satisfies definite assignment on `askTs`.
+    throw error;
+  }
+  // The wait: the FIRST answer settles the ask. No time limit — the decision may land hours later; a
+  // runtime restart interrupts the external call under the at-most-once rule. Every interaction envelope
+  // is already acknowledged by the global `slack_event` handler installed at connect, so nothing is
+  // acked here — this listener only reads the interaction and settles.
+  let answered: Answered;
+  try {
+    answered = await awaitAnswer(connection, offered, askTs, context.signal);
+  } catch (error) {
+    // A cancel is the runtime tearing this call down, not a Slack failure: leave it a plain rejection.
+    if (error instanceof AskCancelled) throw error;
+    katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
+    // `katari.throw` never returns; the rethrow only satisfies definite assignment on `answered`.
+    throw error;
+  }
+  // Strip the controls and leave the outcome, so the channel keeps a readable record and a second answer
+  // has nothing to press. BEST EFFORT: the answer is the valuable thing, and losing a human's decision
+  // to a failed cosmetic edit would be far worse than a prompt left looking live. The record is a fixed
+  // one-liner rather than an echo of what was submitted — a form's text is unbounded and would blow the
+  // block's own size cap, and what to post back is the program's decision, not this package's.
+  const outcome = `${question}\n→ ${answered.receipt}`;
+  const stripped: MessageBlock[] = [{ type: "section", text: { type: "mrkdwn", text: outcome } }];
+  await connection.web.chat
+    .update({ channel, ts: askTs, text: outcome, blocks: stripped })
+    .catch(() => {});
+  return answered.answer;
+});
 
 katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
   "slack_watch",
@@ -344,16 +679,16 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
     const connection = connectionOf(client);
     return new Promise<never>((_resolve, reject) => {
       const listener = (envelope: MessageEnvelope) => {
-        const message = envelope.event;
+        const event = envelope.event;
         // Deliver only a user's own posts in the watched channel: a `bot_id` (this bot's replies
         // included, so delivering cannot loop) and every subtype except `file_share` (edits,
         // deletions, joins — different shapes, not new messages) are skipped. The remaining shapes
         // always carry a user; one that does not is not a user post, so it is skipped too.
-        if (message.channel !== channel || message.user === undefined) return;
-        if (message.bot_id !== undefined) return;
-        if (message.subtype !== undefined && message.subtype !== "file_share") return;
-        const author = message.user;
-        const messageChannel = message.channel;
+        if (event.channel !== channel || event.user === undefined) return;
+        if (event.bot_id !== undefined) return;
+        if (event.subtype !== undefined && event.subtype !== "file_share") return;
+        const author = event.user;
+        const messageChannel = event.channel;
         // Deliver back into the runtime as an inner delegation; the callback's effects escalate
         // through this call to the app's handlers. Attachments download from Slack's file URL (the
         // bot token as a bearer header — Socket Mode has no public downloads) and lift into `file`
@@ -361,7 +696,7 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
         // message). A delivery failure tears the watch down (the app's panic clause reports it).
         void (async () => {
           const files: KatariFile[] = [];
-          for (const attachment of message.files ?? []) {
+          for (const attachment of event.files ?? []) {
             const url = attachment.url_private_download ?? attachment.url_private;
             if (url === undefined) continue;
             const response = await fetch(url, {
@@ -374,12 +709,16 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
               }),
             );
           }
+          // One `message` data value, not a spread of positional fields: the callback's signature stays
+          // the same as its Discord twin's when either platform grows a field.
           await deliver_to.call({
-            channel: messageChannel,
-            author,
-            text: message.text ?? "",
-            thread_ts: message.thread_ts ?? null,
-            files,
+            message: new KatariData("slack.message", {
+              channel: messageChannel,
+              author,
+              text: event.text ?? "",
+              files,
+              thread: event.thread_ts ?? null,
+            }),
           });
         })().catch((error) => {
           cleanup();
