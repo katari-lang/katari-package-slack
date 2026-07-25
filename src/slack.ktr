@@ -182,7 +182,7 @@ program branches on the key it chose and never on display text. Slack caps a but
 characters — an over-cap control is rejected by the platform as `api_error`."
 data button(
   @"The stable key this control answers with; matched as `clicked`'s @id@." id: string,
-  @"The button's visible text (≤75 characters)." label: string,
+  @"The button's visible text (≤75 characters). It is ALSO what the answered message keeps in place of the controls, so write it as the audit line someone reads months later, not only as the press-me word." label: string,
 )
 
 @"A DROPDOWN of fixed options: choosing one answers the ask with `chose`, carrying the option's text
@@ -190,8 +190,8 @@ verbatim (so a program may match the option itself — the options are its own s
 placeholder and each option at 75 characters."
 data select(
   @"The stable key this control answers with; matched as `chose`'s @id@." id: string,
-  @"The dropdown's placeholder text, shown before anything is chosen (≤75 characters)." label: string,
-  @"The options offered; the chosen one comes back verbatim (each ≤75 characters)." options: array[string],
+  @"The dropdown's placeholder text, shown before anything is chosen (≤75 characters). It also opens the audit line the answered message keeps." label: string,
+  @"The options offered; the chosen one comes back verbatim (each ≤75 characters) AND is what the answered message keeps in place of the dropdown, so an option reads as its own audit line." options: array[string],
 )
 
 @"One text input inside a `form`. @value@ is a PREFILL, which is what makes DRAFT EDITING an ordinary
@@ -212,7 +212,7 @@ open question, a prefilled multi-field form reviews a draft. @title@ is capped a
 tighter of the two platforms' caps, so a twin program ports unchanged."
 data form(
   @"The stable key this control answers with; matched as `submitted`'s @id@." id: string,
-  @"The visible text of the button that OPENS the dialog (≤75 characters)." label: string,
+  @"The visible text of the button that OPENS the dialog (≤75 characters). It is ALSO what the answered message keeps in place of the controls, so write it as the audit line someone reads months later." label: string,
   @"The dialog's own heading (≤24 characters)." title: string,
   @"The inputs the dialog collects, in order." fields: array[field],
 )
@@ -263,6 +263,12 @@ Post to a channel whose MEMBERSHIP is the trust boundary: any member may answer.
 answerer's raw Slack user id (an opaque `U…` id, not a name) — a workspace's ids are a small, guessable
 space, so a plain digest of one is dictionary-reversible: tag it with `crypto.hmac_sha256` under a secret
 key before letting it leave the program.
+
+The answered message and the `answer` name things DIFFERENTLY, each for its reader. The line left in the
+channel keeps the control's own @label@ (for a `select`, the chosen option) and MENTIONS the answerer, so a
+human scrolling back reads words and a name; the `answer` carries the @id@ the program chose and @by@ as
+the raw user id, so the program gets keys it can branch on and correlate. That is why a label is worth
+writing as an audit line: it is the half of the record a person will actually read.
 
 Opening a `form`'s dialog and closing it again is NOT an answer: nothing was submitted, so the question
 stays open and any control — that form again, or a sibling — can still answer it. A curious press cannot

@@ -120,6 +120,12 @@ Slack's own size caps apply and are **not** checked here — an over-cap control
 platform and surfaces as `api_error`: a button label or a select option is ≤75 characters, and a form's
 `title` is ≤24. A form's own caps show when its **dialog opens**, not when the question posts.
 
+The answered message and the `answer` name things differently, each for its reader: the line left in the
+channel keeps the control's own `label` (for a `select`, the chosen option) and **mentions** the answerer,
+while the `answer` carries the `id` the program chose and `by` as the raw user id. A human scrolling back
+reads words and a name; the program gets keys it can branch on and correlate. So write a label as the audit
+line someone reads months later — it is the half of the record a person actually reads.
+
 `by` is the answerer's raw Slack user id (an opaque `U…` id, not a name). A workspace's ids are a small,
 guessable space, so a plain digest is dictionary-reversible — tag it with `crypto.hmac_sha256` under a
 secret key before letting it leave the program.
@@ -136,6 +142,18 @@ The two packages carry the same data types with the same fields. Everything that
   takes a ≤75-character button label and select option where Discord takes 80 and 100.
 - **`slack_error` classification** — the same two constructors as Discord's `discord_error`, but
   classified from Slack's error strings (`invalid_auth`, `missing_scope`, …) rather than HTTP statuses.
+- **Delivery guarantee** — Slack acknowledges every event individually, and an acknowledgement lost to a
+  dropped socket makes Slack re-send it, so `watch_messages` here is **at-least-once** (no dedup memory is
+  kept, so a bot that must not act twice dedupes on its own). Discord's gateway has **neither** guarantee:
+  it acks only heartbeats, so a reconnect can *drop* events (a non-resumable session re-identifies and
+  Discord does not backfill) and can *duplicate* them (its sequence is persisted on arrival rather than on
+  delivery, so a replay boundary can sit behind the delivery boundary). A Discord bot that cannot miss
+  anything reconciles against the channel's history; the same code on Slack cannot miss, only repeat.
+
+The first three differences are matters of **shape** — a field, a cap, an error taxonomy — that a program
+sees at the type level. This fourth one is the first difference in **behavior**: the types are identical and
+the code compiles either way, but what the runtime promises about `watch_messages` is not the same, and only
+the docs will tell you.
 
 Form validation is *not* on that list, and deliberately so: both sides make every input optional and both
 return `values` total over the declared fields, with a blank box as `""`. Neither offers per-field
