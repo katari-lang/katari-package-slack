@@ -18,6 +18,7 @@
 import { Buffer } from "node:buffer";
 import {
   katari,
+  KatariCancelledError,
   KatariData,
   type KatariAgent,
   type KatariFile,
@@ -401,20 +402,33 @@ function submittedValues(view: NonNullable<InteractionPayload["view"]>): Record<
   return submitted;
 }
 
-/** The ask's own cancellation (a run cancel / teardown), kept distinct from a Slack failure so it is not
- *  reclassified as a `slack_error` the program would try to catch. */
-class AskCancelled extends Error {
-  constructor() {
-    super("slack ask cancelled");
-    this.name = "AskCancelled";
-  }
-}
-
 /** One settled ask: the `answer` data value the katari side receives, and the one-line record left in
  *  the channel once the controls come off. */
 interface Answered {
   answer: KatariData;
   receipt: string;
+}
+
+/** Replace the prompt's controls with a one-line record of how the ask ended — the SAME path for an answer
+ *  and for a cancel, so a prompt whose deadline expired never keeps live controls a member can still press
+ *  (pressing a dead control shows Slack's own interaction failure, which reads as a broken bot).
+ *
+ *  Best effort throughout: the answer is the valuable thing, and losing a human's decision to a failed
+ *  cosmetic edit would be far worse than a prompt left looking live. The record is a fixed one-liner rather
+ *  than an echo of what was submitted — a form's text is unbounded and would blow the block's own size cap,
+ *  and what to post back is the program's decision, not this package's. */
+async function stripControls(
+  connection: SlackConnection,
+  channel: string,
+  askTs: string,
+  question: string,
+  receipt: string,
+): Promise<void> {
+  const outcome = `${question}\n→ ${receipt}`;
+  const stripped: MessageBlock[] = [{ type: "section", text: { type: "mrkdwn", text: outcome } }];
+  await connection.web.chat
+    .update({ channel, ts: askTs, text: outcome, blocks: stripped })
+    .catch(() => {});
 }
 
 /** The " (by <@U…>)" suffix on the channel's record, empty when Slack reported no user. */
@@ -433,9 +447,9 @@ function awaitAnswer(
   const offered = new Map(controls.map((control) => [control.id, control]));
   return new Promise<Answered>((resolve, reject) => {
     // An `abort` listener on an already-aborted signal never fires, so a call cancelled before the wait
-    // began has to settle here or it would hang forever.
+    // began has to settle here or it would hang forever. Nothing is registered yet, so nothing to clean up.
     if (signal.aborted) {
-      reject(new AskCancelled());
+      reject(new KatariCancelledError());
       return;
     }
     const listener = (interactiveEvent: { body: InteractionPayload }) => {
@@ -505,9 +519,13 @@ function awaitAnswer(
       cleanup();
       reject(error instanceof Error ? error : new Error(String(error)));
     };
-    // The runtime cancelled the call (run cancel / teardown): stop listening and settle. The stale
-    // controls stay in the channel; a later press is acked by the global handler but answers nothing.
-    const abort = () => fail(new AskCancelled());
+    // The runtime cancelled the call (an expired `time.with_deadline`, a cancelled fiber, teardown): stop
+    // listening and settle. `fail` runs `cleanup`, so the socket listener and the abort listener both come
+    // off here — the ask holds no state anywhere else, so a cancelled ask leaks nothing. The caller strips
+    // the now-dead controls off the message. `KatariCancelledError` is the port's own expected-cancellation
+    // reply: any other rejection while aborted still confirms the cancel, but logs a diagnostic with it,
+    // and a deadline-wrapped ask is the RECOMMENDED shape — so its ordinary expiry must be silent.
+    const abort = () => fail(new KatariCancelledError());
     connection.socket.on("interactive", listener);
     signal.addEventListener("abort", abort);
   });
@@ -660,22 +678,19 @@ katari.agent<{
   try {
     answered = await awaitAnswer(connection, offered, askTs, context.signal);
   } catch (error) {
-    // A cancel is the runtime tearing this call down, not a Slack failure: leave it a plain rejection.
-    if (error instanceof AskCancelled) throw error;
+    // A cancel is the runtime tearing this call down, not a Slack failure, so it is never reclassified as a
+    // catchable `slack_error`. It still has to TIDY UP, though: an expired deadline is the ordinary way a
+    // deadline-wrapped ask ends, and leaving its controls live would let a member press a prompt nobody is
+    // waiting on any more. The same strip an answer takes, one line different.
+    if (error instanceof KatariCancelledError) {
+      await stripControls(connection, channel, askTs, question, "(expired)");
+      throw error;
+    }
     katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
     // `katari.throw` never returns; the rethrow only satisfies definite assignment on `answered`.
     throw error;
   }
-  // Strip the controls and leave the outcome, so the channel keeps a readable record and a second answer
-  // has nothing to press. BEST EFFORT: the answer is the valuable thing, and losing a human's decision
-  // to a failed cosmetic edit would be far worse than a prompt left looking live. The record is a fixed
-  // one-liner rather than an echo of what was submitted — a form's text is unbounded and would blow the
-  // block's own size cap, and what to post back is the program's decision, not this package's.
-  const outcome = `${question}\n→ ${answered.receipt}`;
-  const stripped: MessageBlock[] = [{ type: "section", text: { type: "mrkdwn", text: outcome } }];
-  await connection.web.chat
-    .update({ channel, ts: askTs, text: outcome, blocks: stripped })
-    .catch(() => {});
+  await stripControls(connection, channel, askTs, question, answered.receipt);
   return answered.answer;
 });
 

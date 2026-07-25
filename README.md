@@ -99,7 +99,10 @@ still answer it, so a curious press cannot consume the ask. Each control's `id` 
 one ask — the id is the correlation key Slack carries back.
 
 `ask` holds no time limit by design: a deadline is `time.with_deadline` around it, a withdrawal is
-`region.cancel_by_id` on the fiber holding it.
+`region.cancel_by_id` on the fiber holding it. Either way the controls come **off** on the way out and
+`(expired)` is left in their place — the same best-effort strip an answer takes — so an expired prompt is
+never left pressable. A runtime restart is the one ending that cannot tidy up: the sidecar holding the
+prompt is gone, so those controls do go stale.
 
 Slack's own size caps apply and are **not** checked here — an over-cap control is rejected by the
 platform and surfaces as `api_error`: a button label or a select option is ≤75 characters, and a form's
