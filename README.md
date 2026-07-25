@@ -1,32 +1,125 @@
 # slack — a Slack bot capability over Socket Mode
 
-A single module, `slack`, plus its FFI sidecar `src/slack.ts`: watch a channel's messages and post
-replies — threads and file attachments included — the Slack twin of the Discord package. Socket Mode
-means **no public URL and no request-signature verification**: the sidecar opens an outbound WebSocket
-with the app-level token and Slack pushes events over it, while the bot token drives the Web API.
+A single module, `slack`, plus its FFI sidecar `src/slack.ts`. The surface is two planes: **messages**
+in and out (`watch_messages`, `send_message`, `try_send`) and **one interaction primitive** (`ask`) that
+covers every human-in-the-loop shape. It is the Slack half of a twin contract with the **discord**
+package — the same data types with the same fields, so a bot ports between them by swapping the import.
+
+Socket Mode means **no public URL and no request-signature verification**: the sidecar opens an outbound
+WebSocket with the app-level token and Slack pushes events over it, while the bot token drives the Web
+API.
 
 - `slack.provider(bot_source = ..., app_source = ...)` — connects ONCE and serves the client handle for
   the extent of the continuation.
 - `slack.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
-  message (`channel` / `author` / `text` / `thread_ts` / `files`) to your agent. Bot posts (this bot's
-  own replies included) are not delivered, so replying cannot loop.
+  `slack.message` to your agent. Bot posts (this bot's own replies included) are not delivered, so
+  replying cannot loop.
 - `slack.send_message(channel, text, files ?= [], thread_ts ?= null)` — post to a channel, returning
   the posted message's `ts`; a message's `ts` as `thread_ts` replies in its thread, and `files` upload
   as attachments.
 - `slack.try_send(channel, text, files ?= [], thread_ts ?= null)` — the resilient wrapper every bot
   writes: a blank text with no files posts nothing, a transient `api_error` drops just this post, and
   `auth_error` still re-raises.
-- `slack.ask(channel, prompt, options)` — post a Block Kit button prompt and BLOCK until a member of
-  the channel clicks, returning the clicked label. The channel's membership is the trust boundary.
+- `slack.ask(channel, prompt, controls)` — post a prompt with controls and BLOCK until a member of the
+  channel answers, returning the matching `answer`. The channel's membership is the trust boundary.
 - `slack.send_files(channel, files, caption)` — the tool shape of `send_message`, for handing to a model.
 
-Files are first-class on **both** directions: an incoming message's attachments arrive as `file`
-values (downloaded with the bot token, since Slack file URLs are private), and outgoing `file` values
-upload via `files.uploadV2`.
+## The interaction plane
 
-Threads: a delivered `thread_ts` is the thread the message was posted in, or `null` for a top-level
-message — pass it straight back to `send_message` to reply where the message came from (in its thread
-if it had one, in the channel otherwise).
+`ask` takes a list of `control`s and returns one `answer`. Both are plain data sums, so the four
+human-in-the-loop shapes are four control lists rather than four agents:
+
+| shape | controls | answer |
+| --- | --- | --- |
+| approval | two `button`s | `clicked(id, by)` |
+| open question | a one-field `form` | `submitted(id, values, by)` |
+| draft review | a `form` prefilled with the draft, beside a reject `button` | `submitted` / `clicked` |
+| multiple choice | a `select` | `chose(id, option, by)` |
+
+```katari
+data button(id: string, label: string)
+data select(id: string, label: string, options: array[string])
+data field(id: string, label: string, value: string ?= "", multiline: boolean ?= false)
+data form(id: string, label: string, title: string, fields: array[field])
+type control = button | select | form
+
+data clicked(id: string, by: string)
+data chose(id: string, option: string, by: string)
+data submitted(id: string, values: record[string], by: string)
+type answer = clicked | chose | submitted
+```
+
+Every control is live at once and the **first** answer settles the ask; the controls are then stripped
+from the message, so a second answer has nothing to press. Branch on the control's own `id`, never on
+display text:
+
+```katari
+agent approve(channel: string, what: string) -> boolean {
+  let answered = slack.ask(
+    channel = channel,
+    prompt = f"Approve: ${what}?",
+    controls = [
+      slack.button(id = "approve", label = "Approve"),
+      slack.button(id = "deny", label = "Deny"),
+    ],
+  )
+  match (answered) {
+    case slack.clicked(id => "approve", by => _) -> { true }
+    case _ -> { false }
+  }
+}
+```
+
+A `form` is a **two-stage** affair on Slack, because a dialog cannot be opened out of the blue: the form
+posts as an ordinary button, and pressing it is what mints the three-second interaction token
+(`trigger_id`) its dialog opens with. The submission then arrives over the same socket, correlated back
+to the ask by the prompt's `ts`. Two consequences worth knowing:
+
+- **Inputs are not validated.** Slack's own client requires each input to be non-empty and that is the
+  whole of it — the socket acknowledges every interaction the instant it arrives, which is exactly what
+  closes a submitted dialog, so this package cannot answer a submission with per-field errors. Validate
+  in the program and `ask` again.
+- A dialog that cannot be opened (the token expired, a size cap was exceeded) raises `api_error`; catch
+  it and ask again.
+
+Opening a dialog and closing it again is **not** an answer: the question stays open and any control can
+still answer it, so a curious press cannot consume the ask. Each control's `id` must be distinct within
+one ask — the id is the correlation key Slack carries back.
+
+`ask` holds no time limit by design: a deadline is `time.with_deadline` around it, a withdrawal is
+`region.cancel_by_id` on the fiber holding it.
+
+Slack's own size caps apply and are **not** checked here — an over-cap control is rejected by the
+platform and surfaces as `api_error`: a button label or a select option is ≤75 characters, and a form's
+`title` is ≤24.
+
+`by` is the answerer's raw Slack user id (an opaque `U…` id, not a name). Tag it with
+`crypto.hmac_sha256` under a secret key before letting it leave the program.
+
+## Divergences from the discord twin
+
+The two packages carry the same data types with the same fields. Everything that differs is here:
+
+- **`message.thread`** — Slack's only extra field. Slack addresses a thread by its parent's `ts`, which
+  is also a message's identity, so `send_message` returns a `ts` and takes `thread_ts`. Discord has no
+  such value.
+- **`form.title` is capped at 24 characters** — the tighter of the two platforms' caps, so a title that
+  fits here fits Discord too (the reverse does not hold). Every other cap is each platform's own: Slack
+  takes a ≤75-character button label and select option where Discord takes 80 and 100.
+- **No server-side form validation** (above). A Slack dialog's submission is already acknowledged by the
+  time this package sees it, so per-field errors are not offered on either side.
+- **`slack_error` classification** — the same two constructors as Discord's `discord_error`, but
+  classified from Slack's error strings (`invalid_auth`, `missing_scope`, …) rather than HTTP statuses.
+
+## Files and threads
+
+Files are first-class on **both** directions: an incoming message's attachments arrive as `file` values
+(downloaded with the bot token, since Slack file URLs are private), and outgoing `file` values upload
+via `files.uploadV2`.
+
+A delivered `message.thread` is the thread the message was posted in, or `null` for a top-level
+message — pass it straight back as `send_message`'s `thread_ts` to reply where the message came from
+(in its thread if it had one, in the channel otherwise).
 
 Delivery is at-least-once: every event is acknowledged on arrival (so a slow handler does not turn
 into duplicates), but an acknowledgement lost to a dropped socket makes Slack re-send the event, and
@@ -43,7 +136,8 @@ no dedup memory is kept here.
    message events for the conversations you watch: `message.channels` (public channels),
    `message.groups` (private channels), `message.im` (DMs). Socket Mode needs no Request URL.
 5. **Interactivity** (only for `slack.ask`): Features → Interactivity & Shortcuts → toggle on. Socket
-   Mode delivers the button clicks over the same WebSocket, so no Request URL is needed here either.
+   Mode delivers both the button presses and the dialog submissions over the same WebSocket, so no
+   Request URL is needed here either.
 6. Install the app to your workspace: OAuth & Permissions → Install. The Bot User OAuth Token is the
    `xoxb-…` token (`SLACK_BOT_TOKEN`).
 7. Invite the bot to the channel (`/invite @your-bot`) and copy the channel id (the `C…` value in the
@@ -70,8 +164,17 @@ can bundle the sidecar. (A pure-Katari consumer that never applies this package 
 import slack
 
 // Echo every message back where it came from (its thread if it had one), attachments included.
-agent echo(channel: string, author: string, text: string, thread_ts: string | null, files: array[file]) -> null {
-  slack.try_send(channel = channel, text = f"<@${author}> said: ${text}", files = files, thread_ts = thread_ts)
+agent echo(message: slack.message) -> null {
+  match (message) {
+    case slack.message(channel => channel, author => author, text => text, files => files, thread => thread) -> {
+      slack.try_send(
+        channel = channel,
+        text = f"<@${author}> said: ${text}",
+        files = files,
+        thread_ts = thread,
+      )
+    }
+  }
 }
 
 agent main() -> never {
