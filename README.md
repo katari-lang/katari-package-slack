@@ -22,7 +22,17 @@ API.
   `auth_error` still re-raises.
 - `slack.ask(channel, prompt, controls)` — post a prompt with controls and BLOCK until a member of the
   channel answers, returning the matching `answer`. The channel's membership is the trust boundary.
-- `slack.send_files(channel, files, caption)` — the tool shape of `send_message`, for handing to a model.
+
+Posting files is `send_message(files = …)` — there is no second agent for it. Handing that to a model as
+a tool with its own name and description is a **doc-on-let** in the app, not an alias in the library:
+
+```katari
+agent serve(channel: string) -> string {
+  @"Tool: post images or documents to the channel, with a caption."
+  let post_files = slack.send_message
+  ai.complete(tools = [post_files], ...)
+}
+```
 
 ## The interaction plane
 
@@ -186,5 +196,5 @@ agent main() -> never {
 }
 ```
 
-Hand `slack.send_files` to an AI loop's tool list to let the model post images or documents on its
-own.
+Hand `slack.send_message` (or a doc-on-let rename of it) to an AI loop's tool list to let the model post
+into the channel on its own.

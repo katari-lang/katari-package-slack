@@ -163,17 +163,6 @@ agent try_send(
   }
 }
 
-@"Tool: post files (images, documents) to a Slack channel, with a caption; returns the posted message's
-`ts`. Use the channel id given in the conversation context; pass each file as its handle object — a bare
-{\"$katari_ref\": \"<id>\"} suffices."
-agent send_files(
-  @"The id of the channel to post in, from the conversation context." channel: string,
-  @"The files to upload, each passed as its handle object." files: array[file],
-  @"The text posted alongside the files." caption: string,
-) -> string {
-  send_message(channel = channel, text = caption, files = files)
-}
-
 @"Serve a channel forever, delivering each incoming `message` to @deliver_to@ — shaped like
 `time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. The bot's own posts (and
 other bots') are not delivered, so replying from @deliver_to@ cannot loop. Delivery is at-least-once:
