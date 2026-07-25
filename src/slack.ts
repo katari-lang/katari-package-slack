@@ -280,10 +280,13 @@ interface ActionsBlock {
 type MessageBlock = SectionBlock | ActionsBlock;
 
 /** A dialog's input row: one `plain_text_input` under its label. `block_id` and `action_id` are both the
- *  `field`'s own id, so the submission's state map is keyed by exactly what the katari side declared. */
+ *  `field`'s own id, so the submission's state map is keyed by exactly what the katari side declared.
+ *  Always `optional` — a `field` carries no required-ness knob, so requiring one here would be validation
+ *  this package invented and no program asked for; emptying a prefilled draft is a legitimate edit. */
 interface InputBlock {
   type: "input";
   block_id: string;
+  optional: true;
   label: PlainText;
   element: {
     type: "plain_text_input";
@@ -369,6 +372,9 @@ function modalView(control: FormControl, askTs: string): ModalView {
       (field): InputBlock => ({
         type: "input",
         block_id: field.id,
+        // Slack's input blocks default to REQUIRED; a `field` has no knob for that, so opting every one
+        // out is what keeps `values` total over the declared fields — a blank box submits as "".
+        optional: true,
         label: { type: "plain_text", text: field.label },
         element: {
           type: "plain_text_input",

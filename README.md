@@ -85,10 +85,12 @@ posts as an ordinary button, and pressing it is what mints the three-second inte
 (`trigger_id`) its dialog opens with. The submission then arrives over the same socket, correlated back
 to the ask by the prompt's `ts`. Two consequences worth knowing:
 
-- **Inputs are not validated.** Slack's own client requires each input to be non-empty and that is the
-  whole of it — the socket acknowledges every interaction the instant it arrives, which is exactly what
-  closes a submitted dialog, so this package cannot answer a submission with per-field errors. Validate
-  in the program and `ask` again.
+- **Inputs are not validated, at all.** Every box is optional, a blank one comes back as `""`, and
+  `submitted.values` is total over the form's declared fields — a `field` has no required-ness knob, so
+  nothing here invents a check the program never asked for, and clearing a prefilled draft stays a
+  legitimate edit. Nor *could* they be validated: the socket acknowledges every interaction the instant it
+  arrives, which is exactly what closes a submitted dialog, so per-field errors can never be returned.
+  Validate in the program and `ask` again.
 - A dialog that cannot be opened (the token expired, a size cap was exceeded) raises `api_error`; catch
   it and ask again.
 
@@ -101,10 +103,11 @@ one ask — the id is the correlation key Slack carries back.
 
 Slack's own size caps apply and are **not** checked here — an over-cap control is rejected by the
 platform and surfaces as `api_error`: a button label or a select option is ≤75 characters, and a form's
-`title` is ≤24.
+`title` is ≤24. A form's own caps show when its **dialog opens**, not when the question posts.
 
-`by` is the answerer's raw Slack user id (an opaque `U…` id, not a name). Tag it with
-`crypto.hmac_sha256` under a secret key before letting it leave the program.
+`by` is the answerer's raw Slack user id (an opaque `U…` id, not a name). A workspace's ids are a small,
+guessable space, so a plain digest is dictionary-reversible — tag it with `crypto.hmac_sha256` under a
+secret key before letting it leave the program.
 
 ## Divergences from the discord twin
 
@@ -116,10 +119,13 @@ The two packages carry the same data types with the same fields. Everything that
 - **`form.title` is capped at 24 characters** — the tighter of the two platforms' caps, so a title that
   fits here fits Discord too (the reverse does not hold). Every other cap is each platform's own: Slack
   takes a ≤75-character button label and select option where Discord takes 80 and 100.
-- **No server-side form validation** (above). A Slack dialog's submission is already acknowledged by the
-  time this package sees it, so per-field errors are not offered on either side.
 - **`slack_error` classification** — the same two constructors as Discord's `discord_error`, but
   classified from Slack's error strings (`invalid_auth`, `missing_scope`, …) rather than HTTP statuses.
+
+Form validation is *not* on that list, and deliberately so: both sides make every input optional and both
+return `values` total over the declared fields, with a blank box as `""`. Neither offers per-field
+submission errors — Slack's cannot (the submission is already acknowledged by the time this package sees
+it), and neither invents a check the `field` type has no knob for.
 
 ## Files and threads
 

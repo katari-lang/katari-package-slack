@@ -86,8 +86,9 @@ type slack_error = auth_error | api_error
 // ─── the message plane ────────────────────────────────────────────────────────────────────────────
 
 @"One incoming message, as `watch_messages` delivers it. @author@ is the sender's raw Slack user id (an
-opaque `U…` id, not a name); tag it with `crypto.hmac_sha256` under a secret key before letting it leave
-the program, e.g. as an AI provider's abuse-attribution tag. @thread@ is the thread the message was
+opaque `U…` id, not a name) — a workspace's ids are a small, guessable space, so a plain digest of one is
+dictionary-reversible: tag it with `crypto.hmac_sha256` under a secret key before letting it leave the
+program, e.g. as an AI provider's abuse-attribution tag. @thread@ is the thread the message was
 posted in, or `null` for a top-level message — pass it straight back as `send_message`'s @thread_ts@ to
 reply where the message came from. (@thread@ is the Slack twin's one extra field: Discord has no `ts`
 that doubles as a thread address.)"
@@ -194,8 +195,10 @@ data select(
 )
 
 @"One text input inside a `form`. @value@ is a PREFILL, which is what makes DRAFT EDITING an ordinary
-`ask`: ship the draft as @value@ and the human edits it in place. Every field must be filled — Slack's
-own client refuses an empty input, and that is the only validation there is (see `ask`)."
+`ask`: ship the draft as @value@ and the human edits it in place. Every input is OPTIONAL — a box left
+blank comes back as the empty string, so `submitted`'s @values@ is total over the form's declared fields.
+A `field` carries no required-ness knob, so nothing here invents a check the program never asked for, and
+clearing a prefilled draft stays a legitimate edit."
 data field(
   @"The key this field's text is stored under in `submitted`'s @values@." id: string,
   @"The label shown above the input." label: string,
@@ -233,10 +236,13 @@ data chose(
 )
 
 @"A `form` was submitted: @id@ is that form's own id and @values@ maps each `field`'s id to the text the
-human left in it (`record.get` reads one)."
+human left in it (`record.get` reads one). A box left blank is present as the empty string, so @values@ is
+TOTAL over the form's declared fields — a missing key means the field was never declared, not that it went
+unanswered. What came back IS the decision, not a suggestion to re-derive: a submit means \"approved AT
+THESE VALUES\", so acting on @values@ acts on exactly what the human read and sent."
 data submitted(
   @"The `form`'s @id@." id: string,
-  @"Each `field`'s id to the text submitted for it." values: record[string],
+  @"Each `field`'s id to the text submitted for it; a blank box is the empty string." values: record[string],
   @"The answerer's raw Slack user id (`U…`)." by: string,
 )
 
@@ -253,9 +259,10 @@ answer settles the ask; the controls are then stripped from the message, so a se
 to press. Branch on the control's own id — `case clicked(id => \"approve\", by => _)` — never on display
 text.
 
-Post to a channel whose MEMBERSHIP is the trust boundary: any member may answer. @by@ is the answerer's
-raw Slack user id (an opaque `U…` id, not a name); tag it with `crypto.hmac_sha256` under a secret key
-before letting it leave the program.
+Post to a channel whose MEMBERSHIP is the trust boundary: any member may answer. @by@ on the answer is the
+answerer's raw Slack user id (an opaque `U…` id, not a name) — a workspace's ids are a small, guessable
+space, so a plain digest of one is dictionary-reversible: tag it with `crypto.hmac_sha256` under a secret
+key before letting it leave the program.
 
 Opening a `form`'s dialog and closing it again is NOT an answer: nothing was submitted, so the question
 stays open and any control — that form again, or a sibling — can still answer it. A curious press cannot
@@ -265,17 +272,20 @@ The ask holds NO time limit, deliberately: a deadline is `time.with_deadline` wr
 withdrawal is `region.cancel_by_id` on the fiber holding it. One blocking question composes with both,
 whereas an expiry baked in here would make every caller handle a timeout it never asked for.
 
-A `form`'s inputs are NOT validated here. Slack's client requires each input to be non-empty and that is
-the whole of it: the socket acknowledges every interaction the instant it arrives — which is exactly what
-closes the dialog — so this package cannot answer a submission with per-field errors. Validate in the
-program and `ask` again.
+A `form`'s inputs are NOT validated, at all and by design: every box is optional, a blank one comes back as
+the empty string, and `submitted`'s @values@ is total over the declared fields. Nor COULD they be — the
+socket acknowledges every interaction the instant it arrives, which is exactly what closes the dialog, so
+this package can never answer a submission with per-field errors. Validate in the program and `ask` again.
 
 The wait rides one external call, so a runtime restart while it is open interrupts it under the
 at-most-once rule (a catchable panic) and the posted controls go stale. That failure is the DESIGNED
 outcome, not a defect to absorb here: let the panic ride to your supervisor and restart the asking flow —
-whoever wanted the answer asks again — rather than guessing an answer that never landed. Raises
-`slack_error` when the prompt cannot be posted, or when a `form`'s dialog cannot be opened (its
-three-second interaction token expired, a size cap exceeded); catch `api_error` to ask again."
+whoever wanted the answer asks again — rather than guessing an answer that never landed.
+
+Raises `slack_error` when a Slack call fails: posting the question, or opening a `form`'s dialog (its
+three-second interaction token expired). A control past one of Slack's caps is that same failure — the
+platform rejects the payload, surfacing as `api_error` — and a form's OWN caps (its title, its inputs) show
+when the dialog opens, not when the question posts. Catch `api_error` to ask again."
 agent ask(
   @"The id of the channel to ask in — its membership is who may answer." channel: string,
   @"The question posted above the controls (Slack mrkdwn)." prompt: string,
