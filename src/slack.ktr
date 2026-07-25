@@ -270,9 +270,16 @@ consume the ask.
 
 The ask holds NO time limit, deliberately: a deadline is `time.with_deadline` wrapped around it, and a
 withdrawal is `region.cancel_by_id` on the fiber holding it. One blocking question composes with both,
-whereas an expiry baked in here would make every caller handle a timeout it never asked for. Either way the
-controls come OFF on the way out and `(expired)` is left in their place — the same strip an answer takes,
-best effort — so a prompt nobody is waiting on any more is never left pressable.
+whereas an expiry baked in here would make every caller handle a timeout it never asked for.
+
+EVERY ending takes the controls off, not just an answered one, because a question nobody is waiting on any
+more must not stay pressable: an answer leaves its own outcome line, a cancel or an expired deadline leaves
+`(expired)`, and a question the platform broke leaves `(failed)`. All three are the same edit and all three
+are BEST EFFORT — fire-and-forget, so no ending waits on a cosmetic post, and a failed edit is swallowed
+rather than turned into the ask's outcome. Two endings genuinely cannot tidy up: a runtime restart (the
+sidecar holding the prompt is gone) and a whole-run teardown (the provider's `finally` closes the client
+before the edit lands). The everyday case — one arm of a `with_deadline` expiring while the connection stays
+up — does tidy up.
 
 A `form`'s inputs are NOT validated, at all and by design: every box is optional, a blank one comes back as
 the empty string, and `submitted`'s @values@ is total over the declared fields. Nor COULD they be — the
@@ -280,10 +287,9 @@ socket acknowledges every interaction the instant it arrives, which is exactly w
 this package can never answer a submission with per-field errors. Validate in the program and `ask` again.
 
 The wait rides one external call, so a runtime restart while it is open interrupts it under the
-at-most-once rule (a catchable panic). A restart is the ONE ending that cannot tidy up — the sidecar holding
-the prompt is gone, so those controls do go stale. That failure is the DESIGNED outcome, not a defect to
-absorb here: let the panic ride to your supervisor and restart the asking flow — whoever wanted the answer
-asks again — rather than guessing an answer that never landed.
+at-most-once rule (a catchable panic) and leaves those controls stale, per above. That failure is the
+DESIGNED outcome, not a defect to absorb here: let the panic ride to your supervisor and restart the asking
+flow — whoever wanted the answer asks again — rather than guessing an answer that never landed.
 
 Raises `slack_error` when a Slack call fails: posting the question, or opening a `form`'s dialog (its
 three-second interaction token expired). A control past one of Slack's caps is that same failure — the

@@ -99,10 +99,22 @@ still answer it, so a curious press cannot consume the ask. Each control's `id` 
 one ask — the id is the correlation key Slack carries back.
 
 `ask` holds no time limit by design: a deadline is `time.with_deadline` around it, a withdrawal is
-`region.cancel_by_id` on the fiber holding it. Either way the controls come **off** on the way out and
-`(expired)` is left in their place — the same best-effort strip an answer takes — so an expired prompt is
-never left pressable. A runtime restart is the one ending that cannot tidy up: the sidecar holding the
-prompt is gone, so those controls do go stale.
+`region.cancel_by_id` on the fiber holding it.
+
+**Every** ending takes the controls off, not just an answered one, so a question nobody is waiting on any
+more is never left pressable:
+
+| ending | line left in the channel |
+| --- | --- |
+| answered | `→ <outcome> (by <@who>)` |
+| cancelled / deadline expired | `→ (expired)` |
+| broken by the platform (a rejected dialog, a socket fault) | `→ (failed)` |
+
+All three are the same edit, fire-and-forget and best-effort: no ending waits on a cosmetic post, and a
+failed edit is swallowed rather than becoming the ask's outcome. Two endings genuinely cannot tidy up — a
+runtime restart (the sidecar holding the prompt is gone) and a whole-run teardown (the provider's `finally`
+closes the client before the edit lands). The everyday case, one arm of a `with_deadline` expiring while the
+connection stays up, does tidy up.
 
 Slack's own size caps apply and are **not** checked here — an over-cap control is rejected by the
 platform and surfaces as `api_error`: a button label or a select option is ≤75 characters, and a form's

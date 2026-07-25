@@ -409,26 +409,27 @@ interface Answered {
   receipt: string;
 }
 
-/** Replace the prompt's controls with a one-line record of how the ask ended — the SAME path for an answer
- *  and for a cancel, so a prompt whose deadline expired never keeps live controls a member can still press
- *  (pressing a dead control shows Slack's own interaction failure, which reads as a broken bot).
+/** Replace the prompt's controls with @outcome@, a one-line record of how the ask ended. EVERY ending goes
+ *  through here — an answer (its receipt), a cancel (`(expired)`), a platform failure (`(failed)`) — because
+ *  a question nobody is waiting on any more must not keep controls a member can still press: pressing a dead
+ *  control shows Slack's own interaction failure, which reads as a broken bot. One `chat.update` call site,
+ *  so the three endings cannot drift apart.
  *
- *  Best effort throughout: the answer is the valuable thing, and losing a human's decision to a failed
- *  cosmetic edit would be far worse than a prompt left looking live. The record is a fixed one-liner rather
- *  than an echo of what was submitted — a form's text is unbounded and would blow the block's own size cap,
- *  and what to post back is the program's decision, not this package's. */
-async function stripControls(
+ *  FIRE AND FORGET, and it swallows its own failures: no ending may be delayed by a cosmetic edit, nor broken
+ *  by one. Losing a human's decision to a failed `chat.update` would be far worse than a prompt left looking
+ *  live, and a cancel least of all should wait on Slack. The record is a fixed one-liner rather than an echo
+ *  of what was submitted — a form's text is unbounded and would blow the block's own size cap, and what to
+ *  post back is the program's decision, not this package's. */
+function stripControls(
   connection: SlackConnection,
   channel: string,
   askTs: string,
   question: string,
-  receipt: string,
-): Promise<void> {
-  const outcome = `${question}\n→ ${receipt}`;
-  const stripped: MessageBlock[] = [{ type: "section", text: { type: "mrkdwn", text: outcome } }];
-  await connection.web.chat
-    .update({ channel, ts: askTs, text: outcome, blocks: stripped })
-    .catch(() => {});
+  outcome: string,
+): void {
+  const text = `${question}\n→ ${outcome}`;
+  const stripped: MessageBlock[] = [{ type: "section", text: { type: "mrkdwn", text } }];
+  void connection.web.chat.update({ channel, ts: askTs, text, blocks: stripped }).catch(() => {});
 }
 
 /** The " (by <@U…>)" suffix on the channel's record, empty when Slack reported no user. */
@@ -681,16 +682,19 @@ katari.agent<{
     // A cancel is the runtime tearing this call down, not a Slack failure, so it is never reclassified as a
     // catchable `slack_error`. It still has to TIDY UP, though: an expired deadline is the ordinary way a
     // deadline-wrapped ask ends, and leaving its controls live would let a member press a prompt nobody is
-    // waiting on any more. The same strip an answer takes, one line different.
+    // waiting on any more.
     if (error instanceof KatariCancelledError) {
-      await stripControls(connection, channel, askTs, question, "(expired)");
+      stripControls(connection, channel, askTs, question, "(expired)");
       throw error;
     }
+    // The platform broke the ask instead — a rejected `views.open`, a socket fault. The question is over
+    // just as finally as an answered one, so its controls come off too; only the line left behind differs.
+    stripControls(connection, channel, askTs, question, "(failed)");
     katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
     // `katari.throw` never returns; the rethrow only satisfies definite assignment on `answered`.
     throw error;
   }
-  await stripControls(connection, channel, askTs, question, answered.receipt);
+  stripControls(connection, channel, askTs, question, answered.receipt);
   return answered.answer;
 });
 
