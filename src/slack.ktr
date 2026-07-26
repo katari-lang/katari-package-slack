@@ -179,18 +179,22 @@ agent watch_messages[effect E](
 
 @"A pressable BUTTON. @label@ is what the channel reads; @id@ is what comes back on `clicked`, so a
 program branches on the key it chose and never on display text. Slack caps a button's label at 75
-characters — an over-cap control is rejected by the platform as `api_error`."
+characters and an @id@ (an `action_id`) at 255 — an over-cap control is rejected by SLACK as
+`api_error`, never shortened here. That is the one place the Discord twin diverges on caps: Discord
+renders through a client-side builder, so it clamps a caption locally; Slack's caps are the platform's
+own, so write to these numbers rather than relying on either behaviour."
 data button(
-  @"The stable key this control answers with; matched as `clicked`'s @id@." id: string,
+  @"The stable key this control answers with; matched as `clicked`'s @id@ (≤255 characters)." id: string,
   @"The button's visible text (≤75 characters). It is ALSO what the answered message keeps in place of the controls, so write it as the audit line someone reads months later, not only as the press-me word." label: string,
 )
 
 @"A DROPDOWN of fixed options: choosing one answers the ask with `chose`, carrying the option's text
 verbatim (so a program may match the option itself — the options are its own strings). Slack caps the
-placeholder and each option at 75 characters."
+placeholder at 150 characters, each option at 75, and the list at 100 options; over any of them Slack
+rejects the payload as `api_error`."
 data select(
-  @"The stable key this control answers with; matched as `chose`'s @id@." id: string,
-  @"The dropdown's placeholder text, shown before anything is chosen (≤75 characters). It also opens the audit line the answered message keeps." label: string,
+  @"The stable key this control answers with; matched as `chose`'s @id@ (≤255 characters)." id: string,
+  @"The dropdown's placeholder text, shown before anything is chosen (≤150 characters). It also opens the audit line the answered message keeps." label: string,
   @"The options offered; the chosen one comes back verbatim (each ≤75 characters) AND is what the answered message keeps in place of the dropdown, so an option reads as its own audit line." options: array[string],
 )
 
@@ -198,10 +202,13 @@ data select(
 `ask`: ship the draft as @value@ and the human edits it in place. Every input is OPTIONAL — a box left
 blank comes back as the empty string, so `submitted`'s @values@ is total over the form's declared fields.
 A `field` carries no required-ness knob, so nothing here invents a check the program never asked for, and
-clearing a prefilled draft stays a legitimate edit."
+clearing a prefilled draft stays a legitimate edit. Slack caps a box's label at 2000 characters and its
+@id@ (an `action_id`) at 255, and rejects an over-cap dialog as `api_error` when it opens — a far more
+generous label than the Discord twin's 45, which the twin CLAMPS; a `field` that must render on both
+platforms is written to the shorter one."
 data field(
-  @"The key this field's text is stored under in `submitted`'s @values@." id: string,
-  @"The label shown above the input." label: string,
+  @"The key this field's text is stored under in `submitted`'s @values@ (≤255 characters)." id: string,
+  @"The label shown above the input (≤2000 characters)." label: string,
   @"The text the input opens with — a prefill the human edits. Defaults to an empty input." value: string ?= "",
   @"A multi-line textarea instead of a single line. Defaults to single-line." multiline: boolean ?= false,
 )
@@ -211,7 +218,7 @@ data field(
 open question, a prefilled multi-field form reviews a draft. @title@ is capped at 24 characters, the
 tighter of the two platforms' caps, so a twin program ports unchanged."
 data form(
-  @"The stable key this control answers with; matched as `submitted`'s @id@." id: string,
+  @"The stable key this control answers with; matched as `submitted`'s @id@ (≤255 characters — it is the dialog's `callback_id` as well as the button's `action_id`)." id: string,
   @"The visible text of the button that OPENS the dialog (≤75 characters). It is ALSO what the answered message keeps in place of the controls, so write it as the audit line someone reads months later." label: string,
   @"The dialog's own heading (≤24 characters)." title: string,
   @"The inputs the dialog collects, in order." fields: array[field],
@@ -300,7 +307,14 @@ flow — whoever wanted the answer asks again — rather than guessing an answer
 Raises `slack_error` when a Slack call fails: posting the question, or opening a `form`'s dialog (its
 three-second interaction token expired). A control past one of Slack's caps is that same failure — the
 platform rejects the payload, surfacing as `api_error` — and a form's OWN caps (its title, its inputs) show
-when the dialog opens, not when the question posts. Catch `api_error` to ask again."
+when the dialog opens, not when the question posts. Catch `api_error` to ask again.
+
+Nothing here is CLAMPED, and nothing here can panic on a cap: this package renders a view as plain data
+and hands it to Slack, so a string past one of the numbers on `button` / `select` / `field` / `form` is
+Slack's rejection arriving as a typed `api_error` that the call site catches. The Discord twin clamps a
+caption instead, because it renders through a client-side builder whose validators run in its own
+sidecar. Write a portable control to the tighter of the two: a ≤24-character title, ≤45-character field
+labels, ≤75-character button labels and options."
 agent ask(
   @"The id of the channel to ask in — its membership is who may answer." channel: string,
   @"The question posted above the controls (Slack mrkdwn)." prompt: string,

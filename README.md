@@ -139,7 +139,14 @@ The two packages carry the same data types with the same fields. Everything that
   such value.
 - **`form.title` is capped at 24 characters** — the tighter of the two platforms' caps, so a title that
   fits here fits Discord too (the reverse does not hold). Every other cap is each platform's own: Slack
-  takes a ≤75-character button label and select option where Discord takes 80 and 100.
+  takes a ≤75-character button label and select option, a ≤150-character select placeholder, a
+  ≤2000-character `field` label and ≤255-character ids, where Discord takes 80 / 100 / 150 / 45 / 100.
+- **A cap here is enforced by Slack, not clamped locally** — this package renders a view as plain data
+  and posts it, so an over-cap string comes back as a typed `api_error`. The Discord twin renders through
+  `@discordjs/builders`, whose validators run inside its own sidecar, so it *clamps* a caption (a label,
+  a title) with an ellipsis instead of failing the question. Neither side can panic on a cap; only Discord
+  will silently shorten one. A control that must render identically on both is written to the numbers
+  above, taking the smaller of each pair.
 - **`slack_error` classification** — the same two constructors as Discord's `discord_error`, but
   classified from Slack's error strings (`invalid_auth`, `missing_scope`, …) rather than HTTP statuses.
 - **Delivery guarantee** — Slack acknowledges every event individually, and an acknowledgement lost to a
@@ -150,10 +157,10 @@ The two packages carry the same data types with the same fields. Everything that
   delivery, so a replay boundary can sit behind the delivery boundary). A Discord bot that cannot miss
   anything reconciles against the channel's history; the same code on Slack cannot miss, only repeat.
 
-The first three differences are matters of **shape** — a field, a cap, an error taxonomy — that a program
-sees at the type level. This fourth one is the first difference in **behavior**: the types are identical and
-the code compiles either way, but what the runtime promises about `watch_messages` is not the same, and only
-the docs will tell you.
+The extra field, the title cap and the error taxonomy are matters of **shape** — a program sees them at the
+type level. The other two are differences in **behavior**: the types are identical and the code compiles
+either way, but an over-cap caption is shortened on one side and rejected on the other, and what the runtime
+promises about `watch_messages` is not the same. Only the docs will tell you.
 
 Form validation is *not* on that list, and deliberately so: both sides make every input optional and both
 return `values` total over the declared fields, with a blank box as `""`. Neither offers per-field

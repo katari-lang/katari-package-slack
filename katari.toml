@@ -1,6 +1,6 @@
 [package]
 name = "slack"
-version = "0.3.1"
+version = "0.3.2"
 description = "A Slack bot capability over Socket Mode: watch channel messages, post replies (threads and files included), and ask a channel for an answer with buttons, selects and forms. Ships an FFI sidecar (slack.ts)."
 
 [runtime]
