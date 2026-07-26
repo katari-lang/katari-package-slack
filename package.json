@@ -8,7 +8,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@katari-lang/port": "0.1.0-rc8",
+    "@katari-lang/port": "0.1.0-rc10",
     "@slack/socket-mode": "^3.0.0",
     "@slack/web-api": "^8.0.0"
   },
