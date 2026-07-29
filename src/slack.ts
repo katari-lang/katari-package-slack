@@ -737,7 +737,7 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
           // One `message` data value, not a spread of positional fields: the callback's signature stays
           // the same as its Discord twin's when either platform grows a field.
           await deliver_to.call({
-            message: new KatariData("slack.message", {
+            value: new KatariData("slack.message", {
               channel: messageChannel,
               author,
               text: event.text ?? "",

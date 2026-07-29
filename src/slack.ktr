@@ -13,11 +13,13 @@
 // (the sidecar downloads each from Slack's authenticated file URL and uploads it over the blob side
 // channel), and `send_message` posts `file` values back as Slack uploads (`files.uploadV2`).
 //
-// This module is the Slack half of a TWIN CONTRACT with the `discord` package: the same data types
-// with the same fields, so a bot ports between them by swapping the import. Two divergences are
-// deliberate and documented where they appear: `message.thread` / `send_message`'s @thread_ts@ (Slack
-// addresses a thread by its parent's `ts`, which is also a message's identity) and the `slack_error`
-// classification (Slack's error strings rather than Discord's HTTP statuses).
+// This module is the Slack half of a TWIN CONTRACT with the `discord` package: the same data types with
+// the same fields and the same agents with the same argument names, so a bot ports between them by
+// swapping the import. THE COMPLETE LIST OF DIVERGENCES LIVES IN ONE PLACE — this package's README,
+// under "Divergences" — and is checked mechanically by `scripts/check-twin.mjs`, which reads both
+// modules and fails on any shape one side grew without the other, or any divergence not declared there.
+// The prose used to be kept in three places (this header said two divergences, the two READMEs said
+// five and six) and all three were stale; a list nothing checks is a list that drifts.
 
 @"The live Slack connection (the Socket Mode and Web API clients live in the sidecar; the handle is
 opaque)."
@@ -85,13 +87,17 @@ type slack_error = auth_error | api_error
 
 // ─── the message plane ────────────────────────────────────────────────────────────────────────────
 
-@"One incoming message, as `watch_messages` delivers it. @author@ is the sender's raw Slack user id (an
-opaque `U…` id, not a name) — a workspace's ids are a small, guessable space, so a plain digest of one is
-dictionary-reversible: tag it with `crypto.hmac_sha256` under a secret key before letting it leave the
-program, e.g. as an AI provider's abuse-attribution tag. @thread@ is the thread the message was
-posted in, or `null` for a top-level message — pass it straight back as `send_message`'s @thread_ts@ to
-reply where the message came from. (@thread@ is the Slack twin's one extra field: Discord has no `ts`
-that doubles as a thread address.)"
+@"One incoming message, as data: what arrived, where, from whom, with what attached, and in which thread.
+`watch_messages` delivers ONE of these rather than a spread of positional arguments, so a @deliver_to@
+names the fields it reads, has no argument order to get wrong, and keeps its signature when the delivered
+shape grows a field.
+
+@author@ is the sender's raw Slack user id (an opaque `U…` id, not a name) — a workspace's ids are a
+small, guessable space, so a plain digest of one is dictionary-reversible: pass it through `author_tag`
+before letting it leave the program, e.g. as an AI provider's abuse-attribution tag. @thread@ is the
+thread the message was posted in, or `null` for a top-level message — pass it straight back as
+`send_message`'s @thread_ts@ to reply where the message came from. (@thread@ is the Slack twin's one
+extra field: Discord has no `ts` that doubles as a thread address.)"
 data message(
   @"The channel the message was posted in." channel: string,
   @"The sender's raw Slack user id (`U…`)." author: string,
@@ -117,7 +123,7 @@ watch_messages agent."
 external agent slack_watch[effect E](
   @"The opaque handle `create_slack_client` returned." client: string,
   @"The id of the channel to listen on; messages elsewhere are ignored." channel: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (message: message) -> null with E,
+  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
 ) -> never with E
 
 @"Post a message to a channel using the ambient Slack client, returning the posted MESSAGE'S `ts` — the
@@ -136,41 +142,79 @@ agent send_message(
   slack_send(client = connection(), channel = channel, text = text, thread_ts = thread_ts, files = files)
 }
 
+@"A `try_send` that REACHED the channel: the message is posted. It carries nothing — a caller that
+wants the posted message's `ts` wants `send_message` and its own error policy."
+data delivered()
+
+@"A `try_send` that posted NOTHING, with @reason@ saying which of the two silences it was: the
+transient `api_error` this agent swallowed (a rate limit, a channel the bot is not in, a channel id
+that names nothing), or a blank text with no files. It is a VALUE rather than a silence because a
+caller cannot tell the two apart from a `null`, and a program that reports \"posted\" for a post that
+never landed teaches whoever reads it — a person, or a model — something false."
+data dropped(@"Why nothing was posted, in one clause." reason: string)
+
+// What became of one resilient post: it landed, or it did not and here is why. (Type synonyms take no docs.)
+type send_outcome = delivered | dropped
+
 @"Post RESILIENTLY, fire-and-forget — the composition every long-lived bot writes around
 `send_message`, packaged: a blank @text@ with no @files@ posts nothing (a quiet protocol's silence);
 a transient `api_error` (a rate limit, a channel the bot is not in) drops just this post so the bot
-keeps serving; `auth_error` re-raises so a bad token still stops the bot loudly. The posted message's
-`ts` is deliberately dropped — a caller that needs it wants `send_message` and its own error policy."
+keeps serving; `auth_error` re-raises so a bad token still stops the bot loudly.
+
+IT ANSWERS WITH THE OUTCOME (`delivered` | `dropped(reason)`), which is the whole of what changed in
+0.4.0 and the reason it is a breaking change — the same change the Discord twin made in its 0.5.0, and
+for the same reason. The old `-> null` made the two endings indistinguishable from the outside, so every
+caller that reported on its own send reported SUCCESS for a post the channel never received — most
+damagingly a model-facing tool answering \"(posted)\" to an agent that then went on believing it had
+spoken. Dropping the post is still right (one bad send must not end a resident bot); dropping the FACT
+of it was not. The posted message's `ts` is still not carried — a caller that needs it wants
+`send_message`."
 agent try_send(
   @"The id of the channel to post in (e.g. \"C0123456789\")." channel: string,
   @"The message text; blank with no files posts nothing." text: string,
   @"Files to upload as attachments; defaults to none." files: array[file] ?= [],
   @"The parent message's `ts` to reply in its thread; omit (or pass `null`) to post to the channel." thread_ts: string | null ?= null,
-) -> null {
+) -> send_outcome {
   if (string.is_blank(value = text) && array.length(target = files) == 0) {
-    null
+    dropped(reason = "the text was blank and no files were attached, so there was nothing to post")
   } else {
     use handler {
       request prelude.throw(error: slack_error) -> never {
         match (error) {
-          case api_error(message => _) -> { break null }
+          case api_error(message => message) -> { break dropped(reason = f"Slack refused the post (${message})") }
           // The residual is exactly `auth_error` — rethrown as bound, no reconstruction.
           case rest -> { prelude.throw(error = rest) }
         }
       }
     }
     let _message_ts = send_message(channel = channel, text = text, files = files, thread_ts = thread_ts)
-    null
+    delivered()
   }
 }
 
-@"Serve a channel forever, delivering each incoming `message` to @deliver_to@ — shaped like
-`time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. The bot's own posts (and
-other bots') are not delivered, so replying from @deliver_to@ cannot loop. Delivery is at-least-once:
-Slack re-sends an event whose acknowledgement was lost, and no dedup memory is kept here."
+@"Serve a channel forever, delivering each incoming `message` to @deliver_to@ as one `message` value —
+shaped like `time.watch` / `google_calendar.watch` so it composes under `parallel [ … ]`. The bot's own
+posts (and other bots') are not delivered, so replying from @deliver_to@ cannot loop.
+
+@author@ on the delivered message is the sender's raw Slack user id (an opaque `U…` id, but drawn from a
+workspace's small, guessable space); a plain digest of one is dictionary-reversible, so pass it through
+`author_tag` before letting it leave the program, e.g. as an AI provider's abuse-attribution tag.
+
+Delivery is AT-LEAST-ONCE, which is where this differs from the Discord twin's neither-guarantee: Slack
+acknowledges every event individually and re-sends one whose acknowledgement was lost to a dropped
+socket, so a message can be REPEATED but not missed. No dedup memory is kept here, so a bot that must
+not act twice dedupes on its own.
+
+@deliver_to@'s own argument is named @value@, which is what changed in 0.4.0 and part of why it is a
+breaking change. Argument names are STRUCTURAL in Katari — a callback is passed by name, so a callback
+declared `(message: slack.message)` was accepted here and REJECTED by `gmail.watch` / `poll.subscribe`,
+which name theirs @value@ as the prelude's primary-argument convention says. The chat twins were the only
+holdouts, so the same agent could not be handed to a mail watch and a channel watch without an adapter
+that renamed one word. Rename the callback's parameter to @value@ (the type is unchanged) and
+`deliver_to = handler` keeps working everywhere."
 agent watch_messages[effect E](
   @"The id of the channel to listen on (e.g. \"C0123456789\")." channel: string,
-  @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (message: message) -> null with E,
+  @"Called once per incoming message, with the whole message as one value; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
 ) -> never with E | connection | io {
   slack_watch(client = connection(), channel = channel, deliver_to = deliver_to)
 }
@@ -268,8 +312,16 @@ text.
 
 Post to a channel whose MEMBERSHIP is the trust boundary: any member may answer. @by@ on the answer is the
 answerer's raw Slack user id (an opaque `U…` id, not a name) — a workspace's ids are a small, guessable
-space, so a plain digest of one is dictionary-reversible: tag it with `crypto.hmac_sha256` under a secret
-key before letting it leave the program.
+space, so a plain digest of one is dictionary-reversible: pass it through `author_tag` before letting it
+leave the program. That agent is this package's answer to a pseudonym every bot was otherwise writing
+(and getting wrong) for itself: keyed with `crypto.hmac_sha256` under a named secret, so the tag cannot
+be walked back to an account.
+
+RUN `check_controls` WHERE THE CONTROLS ARE BUILT, not here. It answers every one of Slack's caps —
+including the counts and the duplicate ids — as a VALUE, purely, with no connection needed: a gate's
+constructor can refuse itself before a run ever starts. It is deliberately not wired into this agent:
+`ask` returns an `answer` and has no room in that type for a verdict, so an internal check could only
+THROW, and what a failed check means is the caller's decision.
 
 The answered message and the `answer` name things DIFFERENTLY, each for its reader. The line left in the
 channel keeps the control's own @label@ (for a `select`, the chosen option) and MENTIONS the answerer, so a
@@ -331,3 +383,421 @@ external agent slack_ask(
   @"The question posted above the controls." prompt: string,
   @"The controls offered under the prompt." controls: array[control],
 ) -> answer with prelude.throw[slack_error]
+
+// ─── the platform's numbers, and a local check against them ───────────────────────────────────────
+//
+// Slack enforces every one of these ITSELF. This package renders a view as plain data and posts it, so
+// nothing is clamped locally and nothing was checked locally either — an over-cap string came back as
+// `api_error` at the moment the question POSTED, or, for a dialog's own caps, at the moment someone
+// pressed the button, hours after the gate that built the control was written. `limits` publishes the
+// numbers as data and `check_controls` reads them, so "is this question askable?" is a VALUE a program
+// computes before the question posts, next to the code that built the controls.
+//
+// Both are PURE: no connection, no io, nothing to catch. A check that needed the socket would be a check
+// nobody runs at construction time, which is the only time it is worth running.
+//
+// WHERE THESE NUMBERS COME FROM, and why no script checks them. The Discord twin writes its caps down
+// TWICE — once in its sidecar's `LIMIT`, next to the `@discordjs/builders` predicates that enforce them,
+// and once in Katari where a program can read them — and `discord/scripts/check-limits.mjs` fails when
+// the two copies disagree. There is no equivalent here and none is possible: `slack.ts` renders raw
+// Block Kit and validates nothing, and `@slack/web-api` ships no cap constants (its types carry the
+// shapes, not the bounds), so this package holds exactly ONE copy of each number and has nothing to
+// compare it against. What holds them honest instead is a citation per field, to Slack's own reference,
+// read 2026-07-29:
+//
+//   section block (an `ask`'s prompt)   docs.slack.dev/reference/block-kit/blocks/section-block
+//   actions block (the control row)     docs.slack.dev/reference/block-kit/blocks/actions-block
+//   button element                      docs.slack.dev/reference/block-kit/block-elements/button-element
+//   select menu element                 docs.slack.dev/reference/block-kit/block-elements/select-menu-element
+//   option object                       docs.slack.dev/reference/block-kit/composition-objects/option-object
+//   input block                         docs.slack.dev/reference/block-kit/blocks/input-block
+//   plain-text input element            docs.slack.dev/reference/block-kit/block-elements/plain-text-input-element
+//   modal view                          docs.slack.dev/reference/views/modal-views
+//   chat.postMessage                    docs.slack.dev/reference/methods/chat.postMessage
+//
+// A number that moves at Slack moves here by hand, which is the cost of a platform that publishes its
+// bounds only as prose.
+
+@"Slack's limits on what ONE question may present, as data — the numbers Slack refuses a payload
+against, published so a program can read them instead of rediscovering them from a rejected post.
+Lengths are in CHARACTERS; Katari's `string.length` counts code points and Slack's own counting is not
+specified, so a string within a couple of characters of its cap should be shortened rather than trusted
+to either count.
+
+EVERY ONE OF THESE IS FATAL past it, and that is the twin's sharpest divergence: the Discord package
+CLAMPS a caption (a label, a title) with an ellipsis and only refuses what carries meaning, because it
+renders through a client-side builder. This package renders plain data, so there is nothing here that
+shortens anything — an over-cap label, placeholder or title is Slack's rejection arriving as `api_error`,
+exactly as an over-cap id is. Blank is fatal for the same reason: a Block Kit `plain_text` object takes
+at least one character, so an empty label is as illegal as an over-long one and nothing substitutes for
+it (its Discord twin renders the control's own id instead).
+
+`check_controls` reports all of it. Nothing here is silent, so there is no second class of report."
+data caps(
+  @"One message's TEXT as this package posts it: at most this many characters, FATAL past it. It is the cap on an `ask`'s @prompt@ — a question posts as a section block, and Slack refuses a block over this — and it is the number a portable program bounds ALL its text against, since the Discord twin's single @message_text@ (2000) governs its sends too. `send_message` / `try_send`'s @text@ has a laxer cap of its own, @post_text@; this is the one that fails. Source: section block, `text` max 3000." message_text: integer,
+  @"`send_message` / `try_send`'s @text@ alone: Slack TRUNCATES a message past this many characters rather than refusing it — the one cap here that is not fatal, and the one field the Discord twin has no counterpart for (there, one number governs both planes). Slack asks for ≤4000 for readability; this is where the text actually starts disappearing. A program that wants its posts to fit the twin unchanged bounds them by @message_text@ instead. Source: chat.postMessage, `text` truncated past 40000." post_text: integer,
+  @"A `button`'s @label@ — and a `form`'s opening button's: at most this many characters, and at least one. Source: button element, `text` max 75." button_label: integer,
+  @"A `select`'s @label@, the placeholder line: at most this many characters, and at least one. Blank is NOT legal (its Discord twin leaves Discord's own default line): the placeholder is always rendered, so an empty one is an empty `plain_text`. Source: select menu element, `placeholder` max 150." select_label: integer,
+  @"Each of a `select`'s @options@: 1 to this many characters — the option's text IS the answer. The same string is also sent as the option's `value` (cap 150), so the tighter of the two binds. Source: option object, `text` max 75." select_option: integer,
+  @"How many @options@ one `select` may offer: 1 to this many. Source: select menu element, `options` max 100." select_options: integer,
+  @"A `form`'s @title@: at most this many characters. It is the tightest number on either platform, which is why the twin contract asks every portable form to fit it (Discord allows 45 and clamps past it; here it is fatal). Source: modal view, `title` max 24." form_title: integer,
+  @"How many `field` boxes one `form`'s dialog may hold: 1 to this many. Each box is one input block and this package adds no other blocks to the dialog, so the view's block cap is the box cap. Source: modal view, `blocks` max 100." form_fields: integer,
+  @"A `field`'s @label@: at most this many characters, and at least one. Source: input block, `label` max 2000." field_label: integer,
+  @"A `field`'s @value@, the prefilled draft: at most this many characters. Blank is legal — it is the absence of a prefill, and this package omits it rather than sending an empty string. This is the ONE number here Slack does not state: `initial_value` is documented with no cap, but a plain-text input's own content bound is 3000 (its `max_length` accepts 1 to 3000), so a longer prefill cannot survive the box it is put in. DERIVED, not cited — treat it as the safest reading rather than a promise. Source: plain-text input element, `max_length` 1–3000." field_value: integer,
+  @"A `button`'s, `select`'s or `field`'s @id@: 1 to this many characters — it is the `action_id` Slack routes the answer back by, never presentation. Source: button / select menu / plain-text input elements, `action_id` max 255." control_id: integer,
+  @"A `form`'s @id@: 1 to this many characters. The SAME number as @control_id@ here, unlike the Discord twin where a form's id is six shorter — the id rides as both the opening button's `action_id` and the dialog's `callback_id`, and Slack caps them alike. Source: modal view, `callback_id` max 255." form_id: integer,
+  @"How many rows of controls one message may carry. It is 1: this package renders every control into ONE actions block, so a question has exactly one row and @buttons_per_row@ is the whole budget. Source: this package's renderer (`promptBlocks`), bounded by the actions block below." rows: integer,
+  @"How many controls that one row holds — the actions block's element cap. Unlike the Discord twin, a dropdown does NOT take a row of its own here: buttons and selects pack alike, so the layout rule is simply this many controls in total. Source: actions block, `elements` max 25." buttons_per_row: integer,
+)
+
+@"Slack's caps, as one `caps` value — pure, so it costs nothing and composes anywhere (a gate builder,
+a test, an error message that wants to say what the bound was). Every number is cited on the `caps`
+field that carries it, and read from Slack's own reference rather than from a second copy in this
+package: there is no second copy, which is why there is no drift script beside this one (the Discord
+twin has both)."
+agent limits() -> caps {
+  caps(
+    message_text = 3000,
+    post_text = 40000,
+    button_label = 75,
+    select_label = 150,
+    select_option = 75,
+    select_options = 100,
+    form_title = 24,
+    form_fields = 100,
+    field_label = 2000,
+    field_value = 3000,
+    control_id = 255,
+    form_id = 255,
+    rows = 1,
+    buttons_per_row = 25,
+  )
+}
+
+@"The controls are askable exactly as written: every string fits, every count fits, and every id is
+distinct."
+data valid()
+
+@"Something about the controls will not reach the channel as written, and @reason@ names WHICH control
+and WHAT in one line — the first problem found, in declaration order, so a fix at a time converges."
+data invalid(@"Which control, and what is wrong with it." reason: string)
+
+// The verdict `check_controls` returns: askable as written, or the first reason it is not.
+// (Type synonyms take no docs.)
+type control_check = valid | invalid
+
+@"Check @controls@ against Slack's caps LOCALLY and answer with a VALUE — `valid`, or `invalid`
+carrying one sentence naming the offending control. Pure: no connection, no io, nothing to catch, so it
+belongs where the controls are BUILT (a gate's constructor, a test) rather than where they are asked.
+
+It is deliberately NOT wired into `ask`. `ask` returns an `answer`; there is no room in that type for a
+verdict, so an internal check could only THROW, and a caller must be free to decide what a failed check
+means: refuse the gate, shorten the label, ask anyway. The Discord twin took the same decision after an
+outage in which a 67-character label restarted a resident system on every attempt.
+
+WHAT IT REPORTS, and how that differs from the twin. Here EVERYTHING is fatal — Slack refuses the
+payload, so a label past its cap and an id past its cap fail identically, and a BLANK label fails too
+(an empty Block Kit `plain_text` is as illegal as an over-long one). The Discord twin has a second,
+SILENT class to report — captions it would clamp — which this package cannot have, because it clamps
+nothing. So a control that passes here posts as written, exactly:
+
+- Every string on every control: an @id@, a @label@, a `select` placeholder or option, a `form` @title@,
+  a `field` @label@ — blank or past its cap in `limits`.
+- A `field`'s @value@: blank is legal (it is the absence of a prefill), over-long is fatal.
+- The counts: a dropdown with no options or past @select_options@, a dialog with no boxes or past
+  @form_fields@, more controls than the single actions row holds (@buttons_per_row@), and an EMPTY
+  @controls@ — which Slack posts happily as a bare prompt that nobody can ever answer, so the ask waits
+  forever.
+- DUPLICATE ids, which nothing else catches usefully. Two controls sharing an `action_id` cannot be told
+  apart on the way back — Slack returns the id and nothing more — so a press on one would answer as the
+  other, \"deny\" answering as \"approve\". A `form`'s @fields@ are checked the same way, since
+  `submitted.values` is keyed by field id and two boxes sharing one would collapse into a single entry.
+
+Lengths are counted in Unicode code points, and Slack does not specify its own counting; a string within
+a character or two of its cap should be shortened rather than argued about.
+
+```katari
+let controls = [slack.button(id = \"approve\", label = \"Approve\"), slack.button(id = \"deny\", label = \"Deny\")]
+match (slack.check_controls(controls = controls)) {
+  case slack.valid() -> slack.ask(channel = channel, prompt = prompt, controls = controls)
+  case slack.invalid(reason => reason) -> refuse_to_open_the_gate(why = reason)
+}
+```"
+agent check_controls(
+  @"The controls one `ask` would present, in the order it would render them." controls: array[control],
+) -> control_check {
+  let cap = limits()
+
+  // Every string a control carries is LOAD-BEARING here, because Slack refuses rather than repairs:
+  // blank is as fatal as over-long (an empty `plain_text` is rejected), and nothing is substituted.
+  // The Discord twin needs three of these; this package needs one.
+  agent fatal_string(where: string, what: string, value: string, allowed: integer) -> string {
+    if (value == "") {
+      f"${where}: ${what} is blank, which Slack rejects as api_error"
+    } else if (string.length(value = value) > allowed) {
+      f"${where}: ${what} is ${string.length(value = value)} characters where Slack takes ${allowed}, which it rejects as api_error"
+    } else {
+      ""
+    }
+  }
+
+  // Legitimately absent, but fatal when over-long: a `field`'s prefill. Empty means "no draft" and is
+  // omitted from the payload; a draft docked to fit would be approved as though it were whole.
+  agent optional_text(where: string, what: string, value: string, allowed: integer) -> string {
+    if (string.length(value = value) > allowed) {
+      f"${where}: ${what} is ${string.length(value = value)} characters where Slack takes ${allowed}, which it rejects as api_error"
+    } else {
+      ""
+    }
+  }
+
+  // The first non-empty reason, or "" — "" is how every check above spells "nothing wrong", and no real
+  // reason is empty. First in declaration order wins, so a caller fixes one thing at a time.
+  agent first_problem(problems: array[string]) -> string {
+    for (let problem in problems, var found: string = "") {
+      if (found == "" && problem != "") {
+        next with { found = problem }
+      } else {
+        next
+      }
+    } then (_problems) {
+      found
+    }
+  }
+
+  // A control's own id, whichever constructor it is — the correlation key, and how a report names it.
+  agent id_of(control: control) -> string {
+    match (control) {
+      case button(id => id) -> id
+      case select(id => id) -> id
+      case form(id => id) -> id
+    }
+  }
+
+  // Which control a reason is about. The id names it where there is one; a blank id has only its
+  // position, and the position is stated either way because two controls may share an id — which is
+  // itself one of the things reported.
+  agent where_of(index: integer, id: string) -> string {
+    if (id == "") {
+      f"control #${index + 1}"
+    } else {
+      f"control #${index + 1} (\"${id}\")"
+    }
+  }
+
+  // How many rows these controls occupy, laid out exactly as the renderer lays them out: every control
+  // becomes one element of ONE actions block, so they pack `buttons_per_row` to a row and a `select`
+  // takes no row of its own — the Discord twin's layout rule is the divergence, not this one.
+  agent rows_used(controls: array[control]) -> integer {
+    for (let _control in controls, var rows: integer = 0, var pending: integer = 0) {
+      if (pending == cap.buttons_per_row) {
+        next with { rows = rows + 1, pending = 1 }
+      } else {
+        next with { pending = pending + 1 }
+      }
+    } then (_controls) {
+      if (pending > 0) {
+        rows + 1
+      } else {
+        rows
+      }
+    }
+  }
+
+  // A dropdown's options: the COUNT Slack enforces, then each option's own text, which is the answer
+  // itself and is also sent as the option's `value`, so the tighter of the two caps binds.
+  agent options_problem(where: string, options: array[string]) -> string {
+    let count = array.length(target = options)
+    if (count == 0) {
+      f"${where}: the dropdown offers no options; Slack takes 1 to ${cap.select_options}"
+    } else if (count > cap.select_options) {
+      f"${where}: the dropdown offers ${count} options; Slack takes 1 to ${cap.select_options}"
+    } else {
+      for (let option in options, var at: integer = 0, var found: string = "") {
+        let problem = fatal_string(where = where, what = f"option #${at + 1}", value = option, allowed = cap.select_option)
+        if (found == "" && problem != "") {
+          next with { at = at + 1, found = problem }
+        } else {
+          next with { at = at + 1 }
+        }
+      } then (_options) {
+        found
+      }
+    }
+  }
+
+  // A dialog's boxes: the COUNT (the view's block cap, since every box is one input block and the dialog
+  // carries nothing else), each box's strings, and the box ids' DISTINCTNESS — `submitted.values` is
+  // keyed by field id, so two boxes sharing one come back as a single entry and the other box's text is
+  // simply gone.
+  agent fields_problem(where: string, fields: array[field]) -> string {
+    let count = array.length(target = fields)
+    if (count == 0) {
+      f"${where}: the dialog has no boxes; Slack takes 1 to ${cap.form_fields}"
+    } else if (count > cap.form_fields) {
+      f"${where}: the dialog has ${count} boxes; Slack takes 1 to ${cap.form_fields}"
+    } else {
+      for (let box in fields, var at: integer = 0, var seen: record[boolean] = record.empty(), var found: string = "") {
+        let what = f"box #${at + 1}"
+        let duplicate = if (box.id != "" && record.has(target = seen, key = box.id)) {
+          f"${where}: ${what} repeats the field id \"${box.id}\", so both boxes would come back as one entry of submitted.values"
+        } else {
+          ""
+        }
+        let problem = first_problem(problems = [
+          fatal_string(where = where, what = f"${what}'s id", value = box.id, allowed = cap.control_id),
+          duplicate,
+          fatal_string(where = where, what = f"${what}'s label", value = box.label, allowed = cap.field_label),
+          optional_text(where = where, what = f"${what}'s prefill", value = box.value, allowed = cap.field_value),
+        ])
+        if (found == "" && problem != "") {
+          next with { at = at + 1, seen = record.set(target = seen, key = box.id, value = true), found = problem }
+        } else {
+          next with { at = at + 1, seen = record.set(target = seen, key = box.id, value = true) }
+        }
+      } then (_fields) {
+        found
+      }
+    }
+  }
+
+  // One control's own strings, in the order a reader would want them: the id first (it decides whether
+  // the control can be routed at all), then what a human reads.
+  agent control_problem(where: string, control: control) -> string {
+    match (control) {
+      case button(id => id, label => label) -> first_problem(problems = [
+        fatal_string(where = where, what = "the id", value = id, allowed = cap.control_id),
+        fatal_string(where = where, what = "the button's label", value = label, allowed = cap.button_label),
+      ])
+      case select(id => id, label => label, options => options) -> first_problem(problems = [
+        fatal_string(where = where, what = "the id", value = id, allowed = cap.control_id),
+        fatal_string(where = where, what = "the dropdown's placeholder", value = label, allowed = cap.select_label),
+        options_problem(where = where, options = options),
+      ])
+      case form(id => id, label => label, title => title, fields => fields) -> first_problem(problems = [
+        fatal_string(where = where, what = "the id", value = id, allowed = cap.form_id),
+        fatal_string(where = where, what = "the opening button's label", value = label, allowed = cap.button_label),
+        fatal_string(where = where, what = "the dialog's title", value = title, allowed = cap.form_title),
+        fields_problem(where = where, fields = fields),
+      ])
+    }
+  }
+
+  if (array.length(target = controls) == 0) {
+    invalid(reason = "no controls: Slack posts the prompt happily and the question can never be answered")
+  } else {
+    for (let control in controls, var at: integer = 0, var seen: record[boolean] = record.empty(), var found: string = "") {
+      let id = id_of(control = control)
+      let where = where_of(index = at, id = id)
+      // A blank id is reported by `control_problem` as the fatal thing it is, so it is not ALSO reported
+      // as a duplicate of the previous blank one — the first report is the actionable one.
+      let duplicate = if (id != "" && record.has(target = seen, key = id)) {
+        f"${where}: two controls share this id, and Slack carries back nothing else — a press on either would answer as the first"
+      } else {
+        ""
+      }
+      let problem = first_problem(problems = [duplicate, control_problem(where = where, control = control)])
+      if (found == "" && problem != "") {
+        next with { at = at + 1, seen = record.set(target = seen, key = id, value = true), found = problem }
+      } else {
+        next with { at = at + 1, seen = record.set(target = seen, key = id, value = true) }
+      }
+    } then (_controls) {
+      if (found != "") {
+        invalid(reason = found)
+      } else if (rows_used(controls = controls) > cap.rows) {
+        invalid(reason = f"the controls need ${rows_used(controls = controls)} rows and Slack fits ${cap.rows} on this package's prompt: every control is one element of a single actions block, which holds ${cap.buttons_per_row}")
+      } else {
+        valid()
+      }
+    }
+  }
+}
+
+@"Shorten @text@ so it fits in ONE Slack message, ending it with @marker@ when anything was cut — the
+arithmetic every caller was doing against `limits()` by hand, and the half of that job which is
+mechanical rather than editorial.
+
+WHY IT IS NOT MERELY A SLICE. Past `limits()`'s @message_text@ Slack REFUSES an `ask`'s prompt (a
+question is a section block, and an over-long block is `invalid_blocks` → `api_error`), so an over-long
+prompt is a question that can never be asked — a gate that can never be granted, failing identically on
+every retry. The room is therefore @message_text@ MINUS the marker's own length, because the marker is
+part of what gets posted; measuring the text, cutting it to the cap and appending afterwards is the one
+way this is got wrong, and it puts the result back over the cap every time.
+
+It bounds against @message_text@ (3000) rather than @post_text@ (40000) DELIBERATELY, on both counts:
+that is the number a prompt actually fails at, and it is the number the Discord twin's single cap
+governs both planes with — so text fitted here fits there. A plain `send_message` may legitimately carry
+more (Slack truncates it rather than refusing), and a caller who wants that reach bounds it by
+@post_text@ itself.
+
+WHY THE MARKER IS YOURS. Only the caller knows what the reader needs told, but SOMETHING must be told:
+text that was silently docked reads exactly like text that ended, and a model reading it will answer
+from a fragment as though it had the whole. Write the marker as the FACT — \"… (cut: the first 2,900 of
+7,400 characters)\" — rather than as a bare ellipsis, so whoever reads it knows to ask for the rest.
+
+Text that already fits comes back UNCHANGED, with no marker, so this is safe to wrap around everything.
+A @marker@ that alone exceeds the cap leaves no room for any text and comes back cut to the cap itself:
+the one guarantee here is that the result fits."
+agent fit_message(
+  @"The text to fit; returned unchanged when it already does." text: string,
+  @"What to end the result with when anything was cut — your own words, saying that it was cut and ideally by how much." marker: string,
+) -> string {
+  let cap = limits().message_text
+  if (string.length(value = text) <= cap) {
+    text
+  } else {
+    let room = cap - string.length(value = marker)
+    if (room <= 0) {
+      string.slice(value = marker, start = 0, end = cap)
+    } else {
+      f"${string.slice(value = text, start = 0, end = room)}${marker}"
+    }
+  }
+}
+
+// ─── the speaker, pseudonymised ───────────────────────────────────────────────────────────────────
+
+@"Tag a Slack user id into a short, stable PSEUDONYM — the ~25 lines every bot that lets a speaker reach
+a model or a log was writing for itself, with the same one way to get it wrong. This package's own docs
+used to INSTRUCT that hand-rolling, in two places, which is how it became clear it belonged here.
+
+WHY NOT A PLAIN DIGEST. A `U…` id looks opaque but is not drawn from an opaque space: a workspace holds
+some thousands of members at most, and Slack will hand any member's id to any app with `users:read` (or
+simply to whoever reads a mention in a public channel), so the set of candidate ids is small, listable,
+and often already known. `crypto.sha256` of one is therefore reversible by dictionary — anyone holding
+the digest hashes the workspace's ids until one matches, and the pseudonym is a user id again.
+`crypto.hmac_sha256` under a secret KEY has no such attack: without the key there is nothing to hash
+candidates with. That is the whole difference between a pseudonym and an obfuscation, and it is one
+function call wide, which is exactly why it kept being got wrong.
+
+WHAT COMES OUT is safe to SHOW: @length@ hex characters (8 by default — 32 bits, opaque and short enough
+to sit inline in a prompt or a log line), stable for as long as the key is, and meaningless to anyone
+without the key. Rotating the key rotates every pseudonym, which is the intended way to sever a
+correlation. Keep @length@ generous if the tag must be UNIQUE rather than merely readable: 8 hex
+characters collide at around 2^16 distinct speakers by the birthday bound, so a full 64 is what a program
+correlating abuse reports across a large workspace should carry, and a short one is what it shows. The
+result is deliberately PUBLIC despite the private key — an HMAC reveals nothing about its key, which is
+the sound declassification `crypto.hmac_sha256` documents.
+
+THE KEY is named, not passed: a `credentials.source` (`credentials.env(key = ...)` or
+`credentials.oauth(name = ...)`), so the secret's VALUE never enters the app's dataflow. It resolves at
+EVERY call, like every other credential use in Katari, so a rotated key lands without a restart — a bot
+tagging every message pays one credential read per message for that. Any secret with a stable lifetime
+will do; the bot token (`SLACK_BOT_TOKEN`) is the usual choice, since it already exists and dies with the
+bot's identity. Tags do not carry across the Discord twin even under the same key — the two hash
+different id spaces — so one person on both platforms is two pseudonyms, which is the honest answer
+rather than a defect.
+
+WHAT IT IS NOT is an anonymisation. A pseudonym is stable by construction, so it links everything one
+person ever said; what it removes is the ability to turn that link back into an account. Whether even a
+pseudonymous link may cross to an AI provider is the app's judgement — this agent only makes the tag
+correct."
+agent author_tag(
+  @"Where the pseudonym key lives (an env key or an oauth credential name); resolved at each call, never held." source: credentials.source,
+  @"The raw Slack user id to tag: a `message`'s @author@, or an `answer`'s @by@." author: string,
+  @"How many hex characters to keep, from 1 to 64 (the full tag); defaults to 8 — short enough to read, wide enough to tell a channel's speakers apart. Out of range is clamped into it." length: integer ?= 8,
+) -> string with io | prelude.throw[env.missing_secret | oauth.server_error] {
+  let tagged = crypto.hmac_sha256(key = credentials.resolve(source = source), text = author)
+  string.slice(value = tagged, start = 0, end = math.max(left = 1, right = math.min(left = length, right = 64)))
+}
