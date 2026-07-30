@@ -9,11 +9,16 @@ Socket Mode means **no public URL and no request-signature verification**: the s
 WebSocket with the app-level token and Slack pushes events over it, while the bot token drives the Web
 API.
 
-- `slack.provider(bot_source = ..., app_source = ...)` — connects ONCE and serves the client handle for
-  the extent of the continuation.
+Every call carries the tokens it acts with, and nothing in a program points into the sidecar's memory
+(0.5.0, breaking — see below). So a Socket Mode connection belongs to the CALL that needs events and dies
+with it, which is what makes **re-forking a watcher after a runtime restart just work**.
+
+- `slack.provider(bot_source = ..., app_source = ...)` — serves `slack.credential`, the workspace's two
+  tokens, for the extent of the continuation. It connects nothing.
 - `slack.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
   `slack.message` to your agent. Bot posts (this bot's own replies included) are not delivered, so
-  replying cannot loop. The callback's own argument is named `value` (0.4.0).
+  replying cannot loop. The callback's own argument is named `value` (0.4.0). It opens the Socket Mode
+  connection for its own lifetime, so it raises `slack_error` when that connection will not open (0.5.0).
 - `slack.send_message(channel, text, files ?= [], thread_ts ?= null)` — post to a channel, returning
   the posted message's `ts`; a message's `ts` as `thread_ts` replies in its thread, and `files` upload
   as attachments.
@@ -32,27 +37,68 @@ API.
 - `slack.author_tag(source, author, length ?= 8) -> string` — the keyed pseudonym for a speaker's `U…`
   id, so a user id can reach a model or a log without being a user id.
 
-## Breaking changes in 0.4.0
+## Breaking changes in 0.5.0
 
-This release re-synchronises the package with its **discord** twin, which had drifted ahead. Three
-changes, all of them breaking:
+**The `connection` request is gone.** What the provider serves now is the workspace's two tokens:
 
-- **`try_send` answers with its outcome** — `delivered | dropped(reason)` instead of `null`. This is the
-  same change the twin made in its 0.5.0, for the same reason: the old `-> null` made the two endings
-  indistinguishable from the outside, so every caller that reported on its own send reported *success*
-  for a post the channel never received — most damagingly a model-facing tool answering "(posted)" to an
-  agent that then went on believing it had spoken. Dropping the post is still right (one bad send must
-  not end a resident bot); dropping the fact of it was not. A caller that genuinely does not care writes
-  `let _outcome = slack.try_send(…)`.
-- **`watch_messages`'s `deliver_to` is called with `value`, not `message`.** Argument names are
-  structural in Katari, so a callback declared `(message: slack.message)` no longer type-checks here.
-  Rename its parameter to `value` — the type is unchanged. The reason is the ecosystem, not this
-  package: `gmail.watch` and `poll.subscribe` name theirs `value` after the prelude's primary-argument
-  convention, and the two chat twins were the only holdouts, so one agent could not be handed to a mail
-  watch and a channel watch without an adapter that renamed a single word. The twin made the same change
-  in its 0.6.0.
-- **New surface, all of it pure**: `limits`, `check_controls`, `fit_message`, `author_tag` — the twin's
-  four helpers, which this package's docs had until now been *instructing* you to write by hand.
+```katari
+data credential_data(bot_token: string of private, app_token: string of private)
+request credential() -> credential_data
+```
+
+Renaming the row is the whole of the migration for a bot that goes through `send_message` / `try_send` /
+`watch_messages` / `ask`, which is every bot — the low-level externals were never the interface:
+
+| was | is |
+| --- | --- |
+| `with slack.connection \| io` | `with slack.credential \| io` |
+| `slack.create_slack_client(bot_token = …, app_token = …)` | gone — there is nothing to create |
+| `slack.slack_close(client = …)` | gone — there is nothing to close |
+| `slack_send(client = …, …)` | `slack_send(bot_token = …, …)` |
+| `slack_watch(client = …, …)` | `slack_watch(bot_token = …, app_token = …, …)` |
+| `slack_ask(client = …, …)` | `slack_ask(bot_token = …, app_token = …, …)` |
+
+**`watch_messages` raises `slack_error` now, and `provider` no longer does.** Opening the Socket Mode
+connection was the provider's job and is now the job of the call that needs events, so that is where a bad
+app-level token surfaces: `auth_error` from `watch_messages` or `ask` (`api_error` for a transient network
+fault), and `env.missing_secret` / `oauth.server_error` still from the provider's install site but at the
+first call that needs a token rather than at install. A bot that only posts never opens a socket at all, so
+it never learns whether its app-level token is good.
+
+**Why: a handle is not a durable value.** The provider used to connect once and serve the sidecar's opaque
+handle for that connection. A durable program may hold only durable values, and a pointer into one
+process's memory is not one — so a runtime restart replayed the program's committed state (recovery replays
+committed effects instead of re-running them) into a fresh sidecar whose registry was empty, and every call
+through the handle failed. Worse, the documented recovery — re-fork the watcher on `region.crashed` — handed
+the new fiber the *same* dead handle, which made a silent crash loop out of a bot that was merely
+disconnected. The fix is not to detect the staleness but to stop the pointer crossing the boundary: a call
+takes what it needs to ACT (the remote name and the credential), and the sidecar may cache whatever it likes
+keyed by those. Katari's data plane has always worked this way — `store` hands out a key, never a row
+pointer — and `e2b` has always worked this way on the FFI plane (`e2b_run_in(session, code, api_key)`),
+which is why e2b never had this bug. The twin made the same change in its 0.7.0.
+
+### What a restart does now
+
+A Socket Mode connection lives exactly as long as the call that needs it — shared by app-level token while
+several calls want one, closed when the last of them ends — so:
+
+- **A re-forked watcher connects.** `region.crashed` → fork the watcher again is a plain re-fork now: the
+  fresh call opens a fresh connection. Nothing is stale, and there is no session to re-establish.
+- **The interrupted call itself dies, once.** A watch or an ask in flight at the restart is interrupted
+  under the at-most-once rule (a catchable panic). That is not fixable and is not meant to be: whoever
+  wanted the answer asks again.
+- **Everything durable is still there.** A `store` row, a desk's collected replies, a conversation — none
+  of it was ever in the sidecar, and none of it is rebuilt by a replay.
+- **The gap is a gap.** Socket Mode delivers to open sockets, so a message posted while no watcher is
+  running is not delivered at all, and an open `ask`'s controls are left live in the channel (the
+  interrupted call cannot tidy them). A bot that must reconcile the gap reads the channel's history itself.
+
+Coming from 0.3.x, 0.4.0's three breaking changes still apply: `try_send` answers `delivered |
+dropped(reason)` rather than `null` (dropping a post is right, dropping the *fact* of it is not — a caller
+that genuinely does not care writes `let _outcome = slack.try_send(…)`), `watch_messages`'s `deliver_to` is
+called with `value` rather than `message` (argument names are structural, and every other watch in the
+ecosystem names its primary argument `value`), and `limits` / `check_controls` / `fit_message` /
+`author_tag` arrived as pure agents this README had until then been *instructing* you to write by hand.
 
 Posting files is `send_message(files = …)` — there is no second agent for it. Handing that to a model as
 a tool with its own name and description is a **doc-on-let** in the app, not an alias in the library:
@@ -62,7 +108,7 @@ import slack
 import ai
 import ai.types
 
-agent serve(ask: string) -> string with slack.connection | ai.infer_step | io | prelude.throw[ai.duplicate_tool | ai.step_error | slack.slack_error] {
+agent serve(ask: string) -> string with slack.credential | ai.infer_step | io | prelude.throw[ai.duplicate_tool | ai.step_error | slack.slack_error] {
   @"Tool: post images or documents to the channel, with a caption."
   let post_files = slack.send_message
   ai.infer_with_tools(
@@ -105,7 +151,7 @@ display text:
 ```katari
 import slack
 
-agent approve(channel: string, what: string) -> boolean with slack.connection | io | prelude.throw[slack.slack_error] {
+agent approve(channel: string, what: string) -> boolean with slack.credential | io | prelude.throw[slack.slack_error] {
   let answered = slack.ask(
     channel = channel,
     prompt = f"Approve: ${what}?",
@@ -152,10 +198,10 @@ more is never left pressable:
 | broken by the platform (a rejected dialog, a socket fault) | `→ (failed)` |
 
 All three are the same edit, fire-and-forget and best-effort: no ending waits on a cosmetic post, and a
-failed edit is swallowed rather than becoming the ask's outcome. Two endings genuinely cannot tidy up — a
-runtime restart (the sidecar holding the prompt is gone) and a whole-run teardown (the provider's `finally`
-closes the client before the edit lands). The everyday case, one arm of a `with_deadline` expiring while the
-connection stays up, does tidy up.
+failed edit is swallowed rather than becoming the ask's outcome. **One** ending genuinely cannot tidy up — a
+runtime restart, whose interrupted call takes the prompt's identity with it. A whole-run teardown used to be
+the second (the provider's `finally` closed the client before the edit landed) and no longer is: the edit is
+a plain Web API call and 0.5.0 leaves nothing to close underneath it.
 
 ### The caps, and checking a question before you ask it
 
@@ -174,7 +220,7 @@ import slack
 data gate_unaskable(reason: string)
 agent refuse_to_open_the_gate(why: string) -> never with prelude.throw[gate_unaskable] { prelude.throw(error = gate_unaskable(reason = why)) }
 
-agent open_the_gate(channel: string, prompt: string) -> slack.answer with slack.connection | io | prelude.throw[slack.slack_error | gate_unaskable] {
+agent open_the_gate(channel: string, prompt: string) -> slack.answer with slack.credential | io | prelude.throw[slack.slack_error | gate_unaskable] {
   let controls = [slack.button(id = "approve", label = "Approve"), slack.button(id = "deny", label = "Deny")]
   match (slack.check_controls(controls = controls)) {
     case slack.valid() -> slack.ask(channel = channel, prompt = prompt, controls = controls)
@@ -308,8 +354,8 @@ surface:
 
 ```
 $ pnpm test
-the twin contract holds: 30 published name(s) on the slack side, 30 on the discord side,
-11 declared divergence(s), 1 alias(es).
+the twin contract holds: 31 published name(s) on the slack side, 30 on the discord side,
+12 declared divergence(s), 1 alias(es).
 ```
 
 It fails when a name, a field, an argument or a callback's argument exists on one side and not the
@@ -323,14 +369,16 @@ checked out beside this package; `KATARI_DISCORD_KTR` points it elsewhere.
 | --- | --- | --- |
 | `message.thread`, `send_message.thread_ts`, `try_send.thread_ts` | slack | Slack addresses a thread by its parent's `ts`, which is also a message's identity. Discord has no such value, so there is nothing for the twin to carry. |
 | `provider.bot_source` + `provider.app_source` vs `provider.source` | both | Slack genuinely takes two credentials (the `xoxb-…` Web API token and the `xapp-…` socket token); Discord's gateway takes one. |
+| `credential_data` | slack | the resolved counterpart of the row above. Both twins serve the ambient credential as `request credential()`, but Slack's answer is a PAIR and a pair needs a name, so `credential()` here answers `credential_data(bot_token, app_token)` where the twin's answers the `string of private` itself. A program that only calls `send_message` / `watch_messages` / `ask` never sees the difference; one that performs `credential` directly reads two fields here and one string there. |
 | `caps.post_text` | slack | Slack caps a *posted message's* text (40000, truncated) separately from a *block's* text (3000, fatal), so the two planes need two numbers. Discord's single 2000 governs both. |
 | `message.display_name`, `clicked` / `chose` / `submitted`'s `display_name` | discord | `MESSAGE_CREATE` ships a partial guild member beside the author, so the nickname → global name → username chain costs Discord nothing. Slack's message event carries only the `U…` id, so the same field here would mean a `users.info` call per message plus the `users:read` scope. (Slack's *interaction* payloads do carry `user.username`, but that is the account handle, not the workspace display name, which lives in `profile.display_name` and still takes `users.info`.) A program that must read the same on both keeps its logic on `author` / `by`. |
 | `slack_error` / `discord_error` | both | each package names its own failure sum and an app catches the one it imported; the two constructors under it are identical, classified from Slack's error strings here and from HTTP status there. |
 
-Everything else is identical, by construction: `message`, `button`, `select`, `field`, `form`, `clicked`,
-`chose`, `submitted`, `delivered`, `dropped`, `caps`, `valid`, `invalid`, and the agents `provider`,
-`send_message`, `try_send`, `watch_messages`, `ask`, `limits`, `check_controls`, `fit_message` and
-`author_tag` — same names, same fields, same argument names, in the same order.
+Everything else is identical, by construction: the request `credential`, the data `message`, `button`,
+`select`, `field`, `form`, `clicked`, `chose`, `submitted`, `delivered`, `dropped`, `caps`, `valid`,
+`invalid`, and the agents `provider`, `send_message`, `try_send`, `watch_messages`, `ask`, `limits`,
+`check_controls`, `fit_message` and `author_tag` — same names, same fields, same argument names, in the
+same order.
 
 ### Behaviour — the types are identical and only the docs will tell you
 
@@ -345,12 +393,16 @@ Everything else is identical, by construction: `message`, `button`, `select`, `f
   takes no row of its own. Discord packs buttons 5 to a row across 5 rows and gives each dropdown a row
   to itself. Same `caps` fields, genuinely different rules — read `rows` / `buttons_per_row` as a pair.
 - **Delivery guarantee.** Slack acknowledges every event individually, and an acknowledgement lost to a
-  dropped socket makes Slack re-send it, so `watch_messages` here is **at-least-once** (no dedup memory is
-  kept, so a bot that must not act twice dedupes on its own). Discord's gateway has **neither** guarantee:
-  it acks only heartbeats, so a reconnect can *drop* events (a non-resumable session re-identifies and
-  Discord does not backfill) and can *duplicate* them (its sequence is persisted on arrival rather than on
-  delivery, so a replay boundary can sit behind the delivery boundary). A Discord bot that cannot miss
-  anything reconciles against the channel's history; the same code on Slack cannot miss, only repeat.
+  dropped socket makes Slack re-send it, so `watch_messages` here is **at-least-once** *while the watch is
+  running* (no dedup memory is kept, so a bot that must not act twice dedupes on its own). Discord's gateway
+  has **neither** guarantee: it acks only heartbeats, so a reconnect can *drop* events (a non-resumable
+  session re-identifies and Discord does not backfill) and can *duplicate* them (its sequence is persisted
+  on arrival rather than on delivery, so a replay boundary can sit behind the delivery boundary). A Discord
+  bot that cannot miss anything reconciles against the channel's history; the same code on Slack cannot
+  miss, only repeat. **Both sides lose the gap**: each platform delivers to a live connection, and since
+  0.5.0 / 0.7.0 a connection belongs to the watch call, so a message posted while no watcher is running was
+  never delivered to anyone. That is not a divergence, and it is the reason the guarantee is written as a
+  property of a running watch rather than of the bot.
 - **The numbers.** Each platform's caps are its own. A control that must render identically on both is
   written to the **tighter of each pair**, which `pnpm test` prints as the *portable envelope* rather
   than leaving it to be copied by hand: `message_text` 2000, `button_label` 75, `select_option` 75,
@@ -374,9 +426,10 @@ A delivered `message.thread` is the thread the message was posted in, or `null` 
 message — pass it straight back as `send_message`'s `thread_ts` to reply where the message came from
 (in its thread if it had one, in the channel otherwise).
 
-Delivery is at-least-once: every event is acknowledged on arrival (so a slow handler does not turn
-into duplicates), but an acknowledgement lost to a dropped socket makes Slack re-send the event, and
-no dedup memory is kept here.
+Delivery is at-least-once while the watch is running: every event is acknowledged on arrival (so a slow
+handler does not turn into duplicates), but an acknowledgement lost to a dropped socket makes Slack re-send
+the event, and no dedup memory is kept here. A message that arrives while no watch is running — the gap
+around a runtime restart — is not delivered at all, since Socket Mode delivers to open sockets.
 
 ## Slack app setup
 
@@ -399,11 +452,13 @@ no dedup memory is kept here.
 ## Secrets / env
 
 - `SLACK_BOT_TOKEN` — the bot token (`xoxb-…`), used for every Web API call and attachment download.
-- `SLACK_APP_TOKEN` — the app-level token (`xapp-…`), used only to open the Socket Mode connection.
+- `SLACK_APP_TOKEN` — the app-level token (`xapp-…`), used only to open the Socket Mode connection:
+  `watch_messages` and `ask` need one, and a bot that only posts never opens one at all.
 
 Store both in the runtime: `katari env set SLACK_BOT_TOKEN --secret` and
-`katari env set SLACK_APP_TOKEN --secret`. Each is a `string of private`, passed straight to the
-sidecar and never surfaced elsewhere.
+`katari env set SLACK_APP_TOKEN --secret`. Each is a `string of private`, and since 0.5.0 the provider
+serves both into the program under that taint — which is what keeps a token out of a log, a store or an
+outbound message — for each call to hand to the sidecar.
 
 ## Sidecar dependencies
 

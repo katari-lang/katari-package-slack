@@ -73,6 +73,11 @@ const ONLY = [
   },
   {
     side: "slack",
+    path: "credential_data",
+    why: "the resolved counterpart of `provider.bot_source` + `provider.app_source`: `credential` has to serve a PAIR here, so the pair needs a name, where the Discord twin's single gateway token is served as the `string of private` itself",
+  },
+  {
+    side: "slack",
     path: "caps.post_text",
     why: "Slack caps a posted message's text (40000, TRUNCATED) separately from a block's text (3000, FATAL), so the two planes need two numbers; Discord's single 2000 governs both, so its `caps` has one",
   },

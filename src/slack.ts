@@ -1,8 +1,16 @@
 // The sidecar half of `slack.ktr` — the Socket Mode WebSocket plus the Web API client. Handlers
-// register under this file's module path (`slack.*`). Connections live in a module-level map for the
-// sidecar process's lifetime (one process per snapshot), keyed by the opaque handle Katari carries
-// around; the bot token rides in the entry because downloading a message's attachments needs it as a
-// bearer header.
+// register under this file's module path (`slack.*`).
+//
+// EVERY HANDLER TAKES THE TOKENS IT ACTS WITH, and nothing on the Katari side points into this process.
+// That is the fix this file exists in the shape it does for: until 0.4.0 a connection was minted by
+// `create_slack_client`, kept in a module-level map, and named by an opaque handle the program held — and
+// a handle into one process's memory is not a durable value. A runtime restart replayed the program's
+// committed state into a fresh sidecar with an empty map, so `connectionOf` threw on every call and
+// re-forking the watcher handed the new fiber the same dead handle. What is kept here now is a CACHE
+// KEYED BY THE TOKENS: a `WebClient` per bot token (an HTTP wrapper, so a pure optimization) and one
+// shared Socket Mode connection per app-level token, held for exactly as long as the calls that need
+// events and closed when the last of them ends. A restart leaves the cache empty, which is all that it
+// means — the next call fills it, and the calls that were pointing at the old one are themselves gone.
 //
 // Files cross in both directions: an outgoing message's `file` values download over the blob side
 // channel and upload to Slack (`files.uploadV2`); an incoming message's attachments download from
@@ -25,6 +33,7 @@ import {
   type KatariRecord,
   KatariString,
   type KatariText,
+  KatariThrowError,
   type KatariValue,
 } from "@katari-lang/port";
 import { SocketModeClient } from "@slack/socket-mode";
@@ -81,16 +90,99 @@ function slackErrorConstructor(error: unknown): string {
   return code !== undefined && SLACK_AUTH_CODES.has(code) ? "slack.auth_error" : "slack.api_error";
 }
 
-/** One live connection: the event socket, the Web API client, and the bot token the attachment
- *  downloads authenticate with. */
-interface SlackConnection {
-  socket: SocketModeClient;
-  web: WebClient;
-  botToken: string;
+/** The Web API client for a bot token. A `WebClient` opens nothing — it is an HTTP wrapper around the
+ *  token — so keeping one per token is a pure optimization no caller can observe: a miss costs a
+ *  constructor, never a reconnect, and an empty map after a restart is indistinguishable from a full one. */
+const webClients = new Map<string, WebClient>();
+
+function webClientFor(botToken: string): WebClient {
+  const cached = webClients.get(botToken);
+  if (cached !== undefined) return cached;
+  const web = new WebClient(botToken);
+  webClients.set(botToken, web);
+  return web;
 }
 
-const clients = new Map<string, SlackConnection>();
-let nextHandle = 1;
+/** One Socket Mode connection, shared by every live call that wants events on the same app-level token.
+ *  Sharing is a CORRECTNESS requirement rather than a saving: Slack round-robins each event across every
+ *  socket open on an app token, so two sockets would split one channel's traffic between two watchers and
+ *  each would silently miss half of it. */
+interface SharedSocket {
+  appToken: string;
+  socket: SocketModeClient;
+  /** The one `start()`, awaited by every leaseholder — whoever opened the socket and whoever joined while
+   *  it was still connecting fail together on a bad app-level token. */
+  started: Promise<void>;
+  /** How many live calls hold it. The socket closes at zero: a watch that ended, an ask that was answered
+   *  or cancelled. Nothing durable counts here — a restart takes the leases and the socket together. */
+  leases: number;
+}
+
+const sharedSockets = new Map<string, SharedSocket>();
+
+/** Lease the shared socket for an app-level token, opening one if this is the first caller. It comes back
+ *  BEFORE it has connected, deliberately: that lets a caller whose events start arriving the moment the
+ *  connection is up — a watch — attach its listener synchronously and await `started` only after, so
+ *  nothing arrives in the gap between the two. (The 0.4.0 shape connected at provider-install time and
+ *  attached a listener whenever a watch happened to start, and every event in between was acknowledged and
+ *  dropped.) An `ask` has no such gap to close: its own prompt does not exist until the connection is up. */
+function acquireSocket(appToken: string): SharedSocket {
+  const existing = sharedSockets.get(appToken);
+  if (existing !== undefined) {
+    existing.leases += 1;
+    return existing;
+  }
+  const socket = new SocketModeClient({ appToken });
+  // Acknowledge every envelope the moment it arrives, independently of any watcher: Slack re-sends an
+  // event not acked within a few seconds, and a delivery into the runtime can take arbitrarily long, so
+  // acking from the delivery path would turn every slow handler into duplicates. A failed ack (the socket
+  // dropped mid-reply) is deliberately ignored — Slack just re-sends the envelope, which is the
+  // at-least-once contract the watch documents.
+  //
+  // The empty ack is also what an interaction needs: a `block_actions` wants nothing back, and an empty
+  // ack of a `view_submission` is exactly what CLOSES the submitted dialog. It is the reason a form's
+  // inputs cannot be rejected with per-field errors — the envelope is already answered by the time this
+  // package sees it, which `ask` documents as the contract.
+  socket.on("slack_event", ({ ack }: { ack: () => Promise<void> }) => {
+    void ack().catch(() => {});
+  });
+  const shared: SharedSocket = {
+    appToken,
+    socket,
+    started: socket.start().then(() => undefined),
+    leases: 1,
+  };
+  // A connect that failed leaves nothing to reuse, so the entry goes: the next call opens a fresh socket
+  // instead of awaiting a promise that will never resolve. Identity-checked, so a later call's own socket
+  // is never evicted, and every leaseholder still learns of the failure through its own `started`.
+  void shared.started.catch(() => {
+    if (sharedSockets.get(appToken) === shared) sharedSockets.delete(appToken);
+  });
+  sharedSockets.set(appToken, shared);
+  return shared;
+}
+
+/** Give up one lease; the last one out closes the socket. A socket left open keeps receiving events, and
+ *  Slack round-robins each event across every socket open on the app token, so an abandoned socket would
+ *  swallow (acknowledge) messages a live bot then never sees — the hazard the old package armed a `finally`
+ *  around the whole RUN for. Ending with the last CALL is the same guarantee with a lifetime a restart
+ *  cannot outlive. Lingering instead (holding it briefly in case another call wants it) would be a timer
+ *  bought with a connection nobody is using, so the close is immediate and a re-fork pays a fresh connect. */
+function releaseSocket(shared: SharedSocket): void {
+  shared.leases -= 1;
+  if (shared.leases > 0) return;
+  if (sharedSockets.get(shared.appToken) === shared) sharedSockets.delete(shared.appToken);
+  // `disconnect` ends the Socket Mode session — the SDK's documented shutdown: it stops reconnecting and
+  // closes the WebSocket. It runs however `started` SETTLED, and only once it has: a connect still in
+  // flight would race it (the SDK resolves a disconnect that finds no socket yet and then connects
+  // anyway), while a connect that FAILED after its WebSocket had opened leaves the SDK's own reconnect
+  // timer armed — an orphan that would keep stealing and acknowledging this app's events. Neither
+  // failure is anyone's to act on. The Web API client holds no connection, so nothing to release there.
+  void shared.started
+    .catch(() => {})
+    .then(() => shared.socket.disconnect())
+    .catch(() => {});
+}
 
 /** A filename for an attachment payload: Slack requires one; derive the extension from the MIME type
  *  so an image previews inline instead of downloading as a generic binary. */
@@ -421,7 +513,7 @@ interface Answered {
  *  of what was submitted — a form's text is unbounded and would blow the block's own size cap, and what to
  *  post back is the program's decision, not this package's. */
 function stripControls(
-  connection: SlackConnection,
+  web: WebClient,
   channel: string,
   askTs: string,
   question: string,
@@ -429,7 +521,7 @@ function stripControls(
 ): void {
   const text = `${question}\n→ ${outcome}`;
   const stripped: MessageBlock[] = [{ type: "section", text: { type: "mrkdwn", text } }];
-  void connection.web.chat.update({ channel, ts: askTs, text, blocks: stripped }).catch(() => {});
+  void web.chat.update({ channel, ts: askTs, text, blocks: stripped }).catch(() => {});
 }
 
 /** The " (by <@U…>)" suffix on the channel's record, empty when Slack reported no user. */
@@ -440,7 +532,8 @@ function answeredBy(userId: string): string {
 /** Wait for the first answer to the prompt at `askTs`. Presses and choices answer directly; a form's
  *  press only opens its dialog, and the answer is the `view_submission` that follows. */
 function awaitAnswer(
-  connection: SlackConnection,
+  socket: SocketModeClient,
+  web: WebClient,
   controls: Control[],
   askTs: string,
   signal: AbortSignal,
@@ -489,9 +582,7 @@ function awaitAnswer(
             // The press is not the answer — it is the only source of the three-second interaction token
             // a dialog opens with. Keep listening: the answer is this dialog's submission. A failed open
             // fails the ask, because the human pressed and no answer can now arrive through that control.
-            void connection.web.views
-              .open({ trigger_id: triggerId, view: modalView(control, askTs) })
-              .catch(fail);
+            void web.views.open({ trigger_id: triggerId, view: modalView(control, askTs) }).catch(fail);
             return;
           }
         }
@@ -509,7 +600,7 @@ function awaitAnswer(
       }
     };
     const cleanup = () => {
-      connection.socket.off("interactive", listener);
+      socket.off("interactive", listener);
       signal.removeEventListener("abort", abort);
     };
     const settle = (answered: Answered) => {
@@ -527,75 +618,25 @@ function awaitAnswer(
     // reply: any other rejection while aborted still confirms the cancel, but logs a diagnostic with it,
     // and a deadline-wrapped ask is the RECOMMENDED shape — so its ordinary expiry must be silent.
     const abort = () => fail(new KatariCancelledError());
-    connection.socket.on("interactive", listener);
+    socket.on("interactive", listener);
     signal.addEventListener("abort", abort);
   });
 }
 
-katari.agent<{ bot_token: string; app_token: string }>(
-  "create_slack_client",
-  async ({ bot_token, app_token }) => {
-    const socket = new SocketModeClient({ appToken: app_token });
-    // Acknowledge every envelope the moment it arrives, independently of any watcher: Slack re-sends
-    // an event not acked within a few seconds, and a delivery into the runtime can take arbitrarily
-    // long, so acking from the delivery path would turn every slow handler into duplicates. A failed
-    // ack (the socket dropped mid-reply) is deliberately ignored — Slack just re-sends the envelope,
-    // which is the at-least-once contract the watch documents.
-    //
-    // The empty ack is also what an interaction needs: a `block_actions` wants nothing back, and an
-    // empty ack of a `view_submission` is exactly what CLOSES the submitted dialog. It is the reason a
-    // form's inputs cannot be rejected with per-field errors — the envelope is already answered by the
-    // time this package sees it, which `ask` documents as the contract.
-    socket.on("slack_event", ({ ack }: { ack: () => Promise<void> }) => {
-      void ack().catch(() => {});
-    });
-    try {
-      // Opening the Socket Mode WebSocket is the connect: a bad app-level token or a transient network
-      // fault fails here. Raise it as the declared `prelude.throw[slack_error]`, classified auth vs api
-      // (the credential is fixed at start, so a bad token cannot recover), so the provider's caller can
-      // catch it instead of the run panicking. Nothing to close — the socket never came up.
-      await socket.start();
-    } catch (error) {
-      katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
-    }
-    const handle = `slack-${nextHandle}`;
-    nextHandle += 1;
-    clients.set(handle, { socket, web: new WebClient(bot_token), botToken: bot_token });
-    return handle;
-  },
-);
-
-katari.agent<{ client: string }>("slack_close", async ({ client }) => {
-  // The provider arms this as a `finally`, so a run that ends (completes, is cancelled, or unwinds)
-  // tears its Socket Mode connection down: a socket left open keeps receiving events, and Slack
-  // round-robins each event across every socket open on the app token, so a dead run's zombie socket
-  // would swallow messages (acking them) that a live bot then never sees.
-  const connection = clients.get(client);
-  // Idempotent: an unknown or already-closed handle is a no-op — a finalizer may run more than once,
-  // and a sidecar restart drops the map entirely.
-  if (connection === undefined) return null;
-  // Drop the entry before disconnecting so a re-run (or a concurrent lookup) cannot see it half-closed.
-  clients.delete(client);
-  // `disconnect` ends the Socket Mode session — the SDK's documented shutdown: it stops reconnecting
-  // and closes the WebSocket. The Web API client holds no persistent connection, so nothing to close.
-  await connection.socket.disconnect();
-  return null;
-});
-
 katari.agent<{
-  client: string;
+  bot_token: string;
   channel: string;
   text: string;
   thread_ts: string | null;
   files: KatariFile[];
-}>("slack_send", async ({ client, channel, text, thread_ts, files }) => {
-  // An unknown handle is a program defect (a `client` value the runtime never minted), so it stays a
-  // bare throw = panic; only the Slack API calls below fail at execution and become a catchable
-  // `slack_error`.
-  const connection = connectionOf(client);
+}>("slack_send", async ({ bot_token, channel, text, thread_ts, files }) => {
+  // A post is pure Web API: the bot token is the whole of what it takes to act, so this opens no socket
+  // and a post made after a restart is indistinguishable from the first one. Only the Slack calls below
+  // can fail, and each becomes a catchable `slack_error`.
+  const web = webClientFor(bot_token);
   try {
     if (files.length === 0) {
-      const response = await connection.web.chat.postMessage({
+      const response = await web.chat.postMessage({
         channel,
         text,
         ...(thread_ts === null ? {} : { thread_ts }),
@@ -618,14 +659,14 @@ katari.agent<{
     // `uploadV2` returns the file shares rather than a message, so the share's `ts` is dug out for the
     // same thread-reply seam the plain-post path returns.
     if (thread_ts === null) {
-      const response = await connection.web.files.uploadV2({
+      const response = await web.files.uploadV2({
         channel_id: channel,
         ...(text === "" ? {} : { initial_comment: text }),
         file_uploads: uploads,
       });
       return firstShareTs(response) ?? "";
     }
-    const response = await connection.web.files.uploadV2({
+    const response = await web.files.uploadV2({
       channel_id: channel,
       thread_ts,
       ...(text === "" ? {} : { initial_comment: text }),
@@ -643,65 +684,91 @@ katari.agent<{
 });
 
 katari.agent<{
-  client: string;
+  bot_token: string;
+  app_token: string;
   channel: string;
   prompt: KatariText;
   controls: Array<KatariData<KatariRecord>>;
-}>("slack_ask", async ({ client, channel, prompt, controls }, context) => {
-  const connection = connectionOf(client);
+}>("slack_ask", async ({ bot_token, app_token, channel, prompt, controls }, context) => {
+  const web = webClientFor(bot_token);
   const question = typeof prompt === "string" ? prompt : await prompt.text();
   const offered = await Promise.all(controls.map(readControl));
-  let askTs: string;
+  // The answer arrives over the socket, so this call holds one for exactly as long as it waits — and lets
+  // go in the `finally`, whichever way it ends. The question posts only once the connection is up: a
+  // prompt whose answer has nowhere to arrive is worse than no prompt.
+  const shared = acquireSocket(app_token);
   try {
-    const posted = await connection.web.chat.postMessage({
-      channel,
-      text: question,
-      blocks: promptBlocks(question, offered),
-    });
-    if (posted.ts === undefined) {
-      // A successful post always carries a ts; without it an answer cannot be correlated, so fail the
-      // call rather than wait forever on an unidentifiable prompt.
-      throw new Error("slack chat.postMessage returned no message ts");
+    try {
+      await shared.started;
+    } catch (error) {
+      // Opening the connection is now this call's failure rather than the provider's: classify and raise
+      // it as the declared `slack_error` (a bad app-level token is `auth_error`) so the caller can catch
+      // it instead of the run panicking. Nothing was posted.
+      katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
     }
-    askTs = posted.ts;
-  } catch (error) {
-    // Posting the prompt is the first Slack call that can fail; classify and raise it as the declared
-    // `slack_error` exactly as slack_send does.
-    katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
-    // `katari.throw` never returns; the rethrow only satisfies definite assignment on `askTs`.
-    throw error;
-  }
-  // The wait: the FIRST answer settles the ask. No time limit — the decision may land hours later; a
-  // runtime restart interrupts the external call under the at-most-once rule. Every interaction envelope
-  // is already acknowledged by the global `slack_event` handler installed at connect, so nothing is
-  // acked here — this listener only reads the interaction and settles.
-  let answered: Answered;
-  try {
-    answered = await awaitAnswer(connection, offered, askTs, context.signal);
-  } catch (error) {
-    // A cancel is the runtime tearing this call down, not a Slack failure, so it is never reclassified as a
-    // catchable `slack_error`. It still has to TIDY UP, though: an expired deadline is the ordinary way a
-    // deadline-wrapped ask ends, and leaving its controls live would let a member press a prompt nobody is
-    // waiting on any more.
-    if (error instanceof KatariCancelledError) {
-      stripControls(connection, channel, askTs, question, "(expired)");
+    let askTs: string;
+    try {
+      const posted = await web.chat.postMessage({
+        channel,
+        text: question,
+        blocks: promptBlocks(question, offered),
+      });
+      if (posted.ts === undefined) {
+        // A successful post always carries a ts; without it an answer cannot be correlated, so fail the
+        // call rather than wait forever on an unidentifiable prompt.
+        throw new Error("slack chat.postMessage returned no message ts");
+      }
+      askTs = posted.ts;
+    } catch (error) {
+      // Posting the prompt is the first Slack call that can fail; classify and raise it as the declared
+      // `slack_error` exactly as slack_send does.
+      katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
+      // `katari.throw` never returns; the rethrow only satisfies definite assignment on `askTs`.
       throw error;
     }
-    // The platform broke the ask instead — a rejected `views.open`, a socket fault. The question is over
-    // just as finally as an answered one, so its controls come off too; only the line left behind differs.
-    stripControls(connection, channel, askTs, question, "(failed)");
-    katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
-    // `katari.throw` never returns; the rethrow only satisfies definite assignment on `answered`.
-    throw error;
+    // The wait: the FIRST answer settles the ask. No time limit — the decision may land hours later; a
+    // runtime restart interrupts the external call under the at-most-once rule. Every interaction envelope
+    // is already acknowledged by the `slack_event` handler installed with the socket, so nothing is acked
+    // here — this listener only reads the interaction and settles.
+    let answered: Answered;
+    try {
+      answered = await awaitAnswer(shared.socket, web, offered, askTs, context.signal);
+    } catch (error) {
+      // A cancel is the runtime tearing this call down, not a Slack failure, so it is never reclassified as a
+      // catchable `slack_error`. It still has to TIDY UP, though: an expired deadline is the ordinary way a
+      // deadline-wrapped ask ends, and leaving its controls live would let a member press a prompt nobody is
+      // waiting on any more. The edit is a plain Web API call, so it needs nothing this call is letting go of.
+      if (error instanceof KatariCancelledError) {
+        stripControls(web, channel, askTs, question, "(expired)");
+        throw error;
+      }
+      // The platform broke the ask instead — a rejected `views.open`, a socket fault. The question is over
+      // just as finally as an answered one, so its controls come off too; only the line left behind differs.
+      stripControls(web, channel, askTs, question, "(failed)");
+      katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
+      // `katari.throw` never returns; the rethrow only satisfies definite assignment on `answered`.
+      throw error;
+    }
+    stripControls(web, channel, askTs, question, answered.receipt);
+    return answered.answer;
+  } finally {
+    releaseSocket(shared);
   }
-  stripControls(connection, channel, askTs, question, answered.receipt);
-  return answered.answer;
 });
 
-katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
+katari.agent<{
+  bot_token: string;
+  app_token: string;
+  channel: string;
+  deliver_to: KatariAgent;
+}>(
   "slack_watch",
-  ({ client, channel, deliver_to }, context) => {
-    const connection = connectionOf(client);
+  ({ bot_token, app_token, channel, deliver_to }, context) => {
+    // Take the shared socket and attach the listener in the SAME synchronous turn, before the connection
+    // is awaited: `start()` cannot deliver an event before this function returns, so a watch cannot miss a
+    // message its own call was live for. The socket is let go of on every ending, so the last watch or ask
+    // to finish closes it.
+    const shared = acquireSocket(app_token);
     return new Promise<never>((_resolve, reject) => {
       const listener = (envelope: MessageEnvelope) => {
         const event = envelope.event;
@@ -725,7 +792,7 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
             const url = attachment.url_private_download ?? attachment.url_private;
             if (url === undefined) continue;
             const response = await fetch(url, {
-              headers: { Authorization: `Bearer ${connection.botToken}` },
+              headers: { Authorization: `Bearer ${bot_token}` },
             });
             if (!response.ok) continue;
             files.push(
@@ -746,25 +813,36 @@ katari.agent<{ client: string; channel: string; deliver_to: KatariAgent }>(
             }),
           });
         })().catch((error) => {
-          cleanup();
-          reject(error instanceof Error ? error : new Error(String(error)));
+          fail(error instanceof Error ? error : new Error(String(error)));
         });
       };
-      const cleanup = () => connection.socket.off("message", listener);
-      connection.socket.on("message", listener);
-      // The runtime cancelled the call (run cancel / teardown): stop listening and settle.
-      context.signal.addEventListener("abort", () => {
-        cleanup();
-        reject(new Error("slack watch cancelled"));
+      // Stop listening and let go of the socket, once: a start failure and a cancel can both arrive, and
+      // a second release would take a holder off some other call's count.
+      let listening = true;
+      const stopListening = () => {
+        if (!listening) return;
+        listening = false;
+        shared.socket.off("message", listener);
+        releaseSocket(shared);
+      };
+      const fail = (error: Error) => {
+        stopListening();
+        reject(error);
+      };
+      shared.socket.on("message", listener);
+      // The connect itself, which is THIS call's failure now that the provider connects nothing: a bad
+      // app-level token or a network fault raises the declared `slack_error` rather than a panic.
+      void shared.started.catch((error: unknown) => {
+        fail(
+          new KatariThrowError(
+            new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }),
+          ),
+        );
       });
+      // The runtime cancelled the call (a cancelled fiber, a re-forked watcher's predecessor, run
+      // teardown): stop listening and settle as the port's expected cancellation, so the ordinary way a
+      // watcher ends does not read as a fault in the diagnostics.
+      context.signal.addEventListener("abort", () => fail(new KatariCancelledError()));
     });
   },
 );
-
-function connectionOf(handle: string): SlackConnection {
-  const connection = clients.get(handle);
-  if (connection === undefined) {
-    throw new Error(`unknown slack client handle: ${handle}`);
-  }
-  return connection;
-}

@@ -1,13 +1,22 @@
-// The Slack library: a Socket Mode connection capability plus the chat surface — the message plane
-// (`watch_messages` in, `send_message` / `try_send` out) and the interaction plane (`ask`). The
-// externals are implemented in `slack.ts` (the same module path, so they register under `slack.*`).
+// The Slack library: the workspace's two tokens as an ambient capability, plus the chat surface — the
+// message plane (`watch_messages` in, `send_message` / `try_send` out) and the interaction plane (`ask`).
+// The externals are implemented in `slack.ts` (the same module path, so they register under `slack.*`).
 // The one-line integration is the provider:
 // `use slack.provider(bot_source = credentials.env(key = "SLACK_BOT_TOKEN"), app_source = credentials.env(key = "SLACK_APP_TOKEN"))`.
 //
 // Socket Mode needs no public URL and no request-signature verification: the sidecar opens an outbound
 // WebSocket with the app-level token (`xapp-…`) and Slack pushes events over it, while the bot token
-// (`xoxb-…`) drives the Web API (posting, uploads, attachment downloads, dialogs). Both tokens stay
-// inside the sidecar, keyed by the opaque client handle — they are never served as a value.
+// (`xoxb-…`) drives the Web API (posting, uploads, attachment downloads, dialogs).
+//
+// EVERY CALL CARRIES THE TOKENS IT ACTS WITH, which is the whole of 0.5.0 and why it is breaking. A
+// durable program may hold only durable values, and a handle into one process's memory is not one: the
+// provider used to open ONE connection and serve the sidecar's opaque handle for it, so a runtime restart
+// replayed a program still holding that handle into a sidecar whose registry was empty — every call
+// through it failed, and re-forking the watcher handed the fresh fiber the same dead handle. Tokens are
+// durable and tokens are all the sidecar needs to ACT: it opens a Socket Mode connection for the extent of
+// the CALL that needs events, shared by app token while more than one call wants it, so nothing on this
+// side points into that process. A watcher re-forked after a restart simply connects. (`e2b` has always
+// had this shape — a sandbox id plus an api key — which is why it never had the bug.)
 //
 // Files are first-class on both directions: an incoming message's attachments arrive as `file` values
 // (the sidecar downloads each from Slack's authenticated file URL and uploads it over the blob side
@@ -21,56 +30,64 @@
 // The prose used to be kept in three places (this header said two divergences, the two READMEs said
 // five and six) and all three were stale; a list nothing checks is a list that drifts.
 
-@"The live Slack connection (the Socket Mode and Web API clients live in the sidecar; the handle is
-opaque)."
-request connection() -> string
+@"The Slack credentials a call acts with, as one value: the bot token (`xoxb-…`) the Web API
+authenticates with, and the app-level token (`xapp-…`) the Socket Mode WebSocket opens with. Both are
+`string of private`, so their taint keeps them out of anything the program prints, stores or sends
+onward. This is what a durable program holds — a SELF-CONTAINED reference, usable from any process,
+rather than a handle into one sidecar's memory. It is the shape `e2b`'s `session_data` has had all along."
+data credential_data(
+  @"The bot token (`xoxb-…`) every Web API call authenticates with." bot_token: string of private,
+  @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
+)
 
-@"Provide the Slack connection for the extent of the continuation: resolve the two sources ONCE (a
-socket credential is fixed at connect — a rotation lands on the next restart, not mid-connection),
-connect over Socket Mode, then serve `connection` to everything downstream. A failed connect (a bad
-`xapp-…` token, a transient network fault) raises `slack_error` (`auth_error` | `api_error`) —
-surfacing here rather than on the first send. Slack genuinely takes TWO credentials, so there are two
-sources: the bot token (`xoxb-…`, the Web API) and the app-level token (`xapp-…`, the socket)."
+@"The ambient Slack credentials: the two tokens every call in the provider's scope acts with. The
+provider serves it by resolving both sources at EACH request, so a rotated token lands on the next call
+rather than the next restart. Performing it CONNECTS NOTHING — a Socket Mode connection belongs to the
+call that needs events (`watch_messages`, `ask`) and lives exactly as long as that call."
+request credential() -> credential_data
+
+@"Provide the Slack credentials for the extent of the continuation: serve `credential` to everything
+downstream, resolving @bot_source@ and @app_source@ at each request so a rotated token lands on the next
+call rather than the next restart.
+
+NOTHING IS CONNECTED HERE, which is what changed in 0.5.0. A Socket Mode connection belongs to the call
+that needs events — `watch_messages`, `ask` — and lives exactly as long as it, so a watcher re-forked
+after a runtime restart opens a fresh connection and simply works. The provider used to connect once and
+serve the sidecar's handle for that connection, which a restart turned into a pointer at nothing.
+
+WHERE FAILURES SURFACE moved with it. A missing or unreadable secret still raises
+`env.missing_secret` / `oauth.server_error` from HERE (the request's handler runs at this install site),
+but on the first call that needs a token rather than at install. A bad TOKEN is no longer this agent's
+failure at all: it surfaces as `slack_error` from the call that used it (`watch_messages`, `ask`,
+`send_message`), so a bot that only posts never learns whether its app-level token is good — nothing
+opens a socket for it.
+
+Slack genuinely takes TWO credentials, so there are two sources: the bot token (`xoxb-…`, the Web API)
+and the app-level token (`xapp-…`, the socket)."
 agent provider[R, effect E](
-  @"Where the bot token (`xoxb-…`) lives; resolved once at connect." bot_source: credentials.source,
-  @"Where the app-level token (`xapp-…`) lives; resolved once at connect." app_source: credentials.source,
-  @"Runs with `connection` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, connection},
-) -> R with E | io | prelude.throw[slack_error | env.missing_secret | oauth.server_error] {
-  let client = create_slack_client(bot_token = credentials.resolve(source = bot_source), app_token = credentials.resolve(source = app_source))
-  // Bind the socket's lifetime to this run: however the provider ends — normal completion, cancel, or
-  // the continuation unwinding — close the connection on the way out. A socket left open keeps
-  // receiving events, and Slack round-robins each event across every socket open on the app token, so a
-  // dead run's zombie socket would swallow messages (acking them) that a live bot then never sees.
-  finally { slack_close(client = client) }
+  @"Where the bot token (`xoxb-…`) lives; resolved at each `credential` request." bot_source: credentials.source,
+  @"Where the app-level token (`xapp-…`) lives; resolved at each `credential` request." app_source: credentials.source,
+  @"Runs with `credential` served; its result is the provider's result." continuation: agent (value: null) -> R with {...E, credential},
+) -> R with E | io | prelude.throw[env.missing_secret | oauth.server_error] {
   use handler {
-    request connection() { next client }
+    // Both credentials resolve per request, which is now the whole of what this handler does: there is
+    // no connection to establish and so nothing to cache, and a rotation lands on the next call.
+    request credential() {
+      next credential_data(
+        bot_token = credentials.resolve(source = bot_source),
+        app_token = credentials.resolve(source = app_source),
+      )
+    }
   }
   continuation(value = null)
 }
 
-@"Connect to Slack — open the Socket Mode WebSocket and the Web API client — and return an opaque
-client handle. Raises `slack_error` (`auth_error` | `api_error`) when the connect fails — a bad
-app-level token is `auth_error`, a transient network fault `api_error`. Prefer the provider."
-external agent create_slack_client(
-  @"The bot token (`xoxb-…`) every Web API call authenticates with." bot_token: string of private,
-  @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
-) -> string with prelude.throw[slack_error]
-
-@"Close a Slack connection: disconnect the Socket Mode WebSocket and drop the client handle. The
-provider arms this as a `finally`, so the connection dies with the run — a socket left open keeps
-receiving events, and Slack round-robins each event across every socket open on the app token, so a
-dead run's zombie socket would swallow messages (acking them) that a live bot then never sees.
-Idempotent: closing an unknown or already-closed handle is a no-op, since a finalizer may run more
-than once."
-external agent slack_close(
-  @"The opaque handle `create_slack_client` returned." client: string,
-) -> null
-
 @"An authentication / authorization failure: the bot token is invalid, revoked, or missing a scope the
-call needs (Slack `invalid_auth`, `token_revoked`, `missing_scope`, …); @message@ carries Slack's error
-string. The bot cannot recover on its own — the operator must fix the token or scopes and restart the
-run (the connection is fixed at start). Let it surface so the bot stops loudly rather than silently
-dropping every reply."
+call needs (Slack `invalid_auth`, `token_revoked`, `missing_scope`, …), or the app-level token will not
+open a socket; @message@ carries Slack's error string. The bot cannot recover on its own — the operator
+must fix the token or the scopes. Let it surface so the bot stops loudly rather than silently dropping
+every reply. (A rotated token does NOT need a restart: every call resolves the credential afresh, so the
+next attempt uses the new one.)"
 data auth_error(message: string)
 
 @"A Slack API call failed for a non-auth reason: a rate limit, a transient network fault, a channel the
@@ -106,27 +123,34 @@ data message(
   @"The `ts` of the thread this message belongs to, or `null` for a top-level message." thread: string | null,
 )
 
-@"Low-level: post to a channel on a given client — a thread reply when @thread_ts@ carries a `ts`, a
+@"Low-level: post to a channel with @bot_token@ — a thread reply when @thread_ts@ carries a `ts`, a
 channel post when it is `null`; any files upload as attachments — returning the posted message's `ts`
-(a plain post's own `ts`, a file upload's share `ts`, or `\"\"` when Slack reports none). Raises
-`auth_error` or `api_error` (`slack_error`) when the Slack API call fails. Prefer the send_message agent."
+(a plain post's own `ts`, a file upload's share `ts`, or `\"\"` when Slack reports none). A post is pure
+Web API, so this opens NO socket and needs no app-level token: the bot token is the whole of what it
+takes to act. Raises `auth_error` or `api_error` (`slack_error`) when the Slack API call fails. Prefer
+the send_message agent."
 external agent slack_send(
-  @"The opaque handle `create_slack_client` returned." client: string,
+  @"The bot token (`xoxb-…`) to post with." bot_token: string of private,
   @"The id of the channel to post in (e.g. \"C0123456789\")." channel: string,
   @"The message text (Slack mrkdwn); with files it becomes their caption." text: string,
   @"The parent message's `ts` to reply in its thread, or `null` to post to the channel." thread_ts: string | null,
   @"Files to upload as the message's attachments (`[]` for a plain text post)." files: array[file],
 ) -> string with prelude.throw[slack_error]
 
-@"Low-level: listen on a channel and deliver each incoming message to a callback. Prefer the
-watch_messages agent."
+@"Low-level: listen on a channel and deliver each incoming message to a callback. The Socket Mode
+connection is opened for the extent of THIS call (shared with any other live call on the same
+@app_token@, closed when the last one ends), and the listener is attached before it is used, so no event
+arrives before something is there to receive it. @bot_token@ is what an attachment downloads with.
+Raises `slack_error` when the connection cannot be opened — a bad app-level token is `auth_error`.
+Prefer the watch_messages agent."
 external agent slack_watch[effect E](
-  @"The opaque handle `create_slack_client` returned." client: string,
+  @"The bot token (`xoxb-…`) an incoming attachment downloads with." bot_token: string of private,
+  @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
   @"The id of the channel to listen on; messages elsewhere are ignored." channel: string,
   @"Called once per incoming message; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
-) -> never with E
+) -> never with E | prelude.throw[slack_error]
 
-@"Post a message to a channel using the ambient Slack client, returning the posted MESSAGE'S `ts` — the
+@"Post a message to a channel with the ambient Slack credentials, returning the posted MESSAGE'S `ts` — the
 composable seam a later edit / thread-reply agent will address a message by, so a caller that needs to
 refer back keeps it (and one that does not simply drops it). Pass a message's `ts` as @thread_ts@ to
 reply in its thread (a delivered `message.thread` passed straight back replies where it came from);
@@ -139,7 +163,9 @@ agent send_message(
   @"Files to upload as the message's attachments; defaults to none." files: array[file] ?= [],
   @"The parent message's `ts` to reply in its thread; omit (or pass `null`) to post to the channel." thread_ts: string | null ?= null,
 ) -> string {
-  slack_send(client = connection(), channel = channel, text = text, thread_ts = thread_ts, files = files)
+  // A post needs only the bot token, so it never opens a socket — the app-level token stays unused here.
+  let tokens = credential()
+  slack_send(bot_token = tokens.bot_token, channel = channel, text = text, thread_ts = thread_ts, files = files)
 }
 
 @"A `try_send` that REACHED the channel: the message is posted. It carries nothing — a caller that
@@ -200,10 +226,20 @@ posts (and other bots') are not delivered, so replying from @deliver_to@ cannot 
 workspace's small, guessable space); a plain digest of one is dictionary-reversible, so pass it through
 `author_tag` before letting it leave the program, e.g. as an AI provider's abuse-attribution tag.
 
-Delivery is AT-LEAST-ONCE, which is where this differs from the Discord twin's neither-guarantee: Slack
-acknowledges every event individually and re-sends one whose acknowledgement was lost to a dropped
-socket, so a message can be REPEATED but not missed. No dedup memory is kept here, so a bot that must
-not act twice dedupes on its own.
+Delivery is AT-LEAST-ONCE WHILE THIS CALL IS RUNNING, which is where it differs from the Discord twin's
+neither-guarantee: Slack acknowledges every event individually and re-sends one whose acknowledgement was
+lost to a dropped socket, so a message can be REPEATED but not missed. No dedup memory is kept here, so a
+bot that must not act twice dedupes on its own. What is outside the guarantee is the time when this call
+is NOT running: Socket Mode delivers to open sockets, so a message posted while the watcher is down (the
+gap around a runtime restart) is never delivered at all — a bot that must reconcile that gap reads the
+channel's history itself.
+
+THE CONNECTION IS THIS CALL'S. It opens when the watch starts (shared with any other live watch or `ask`
+on the same app-level token, closed when the last of them ends) and dies with the call, so a runtime
+restart interrupts the watch under the at-most-once rule and RE-FORKING IT is the whole of the recovery —
+there is no session to re-establish and nothing stale to discard. Raises `slack_error` when the connection
+cannot be opened: `auth_error` for a bad app-level token (the operator's problem — let it stop the bot
+loudly), `api_error` for a transient network fault.
 
 @deliver_to@'s own argument is named @value@, which is what changed in 0.4.0 and part of why it is a
 breaking change. Argument names are STRUCTURAL in Katari — a callback is passed by name, so a callback
@@ -215,8 +251,9 @@ that renamed one word. Rename the callback's parameter to @value@ (the type is u
 agent watch_messages[effect E](
   @"The id of the channel to listen on (e.g. \"C0123456789\")." channel: string,
   @"Called once per incoming message, with the whole message as one value; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
-) -> never with E | connection | io {
-  slack_watch(client = connection(), channel = channel, deliver_to = deliver_to)
+) -> never with E | credential | io | prelude.throw[slack_error] {
+  let tokens = credential()
+  slack_watch(bot_token = tokens.bot_token, app_token = tokens.app_token, channel = channel, deliver_to = deliver_to)
 }
 
 // ─── the interaction plane ────────────────────────────────────────────────────────────────────────
@@ -341,20 +378,22 @@ EVERY ending takes the controls off, not just an answered one, because a questio
 more must not stay pressable: an answer leaves its own outcome line, a cancel or an expired deadline leaves
 `(expired)`, and a question the platform broke leaves `(failed)`. All three are the same edit and all three
 are BEST EFFORT — fire-and-forget, so no ending waits on a cosmetic post, and a failed edit is swallowed
-rather than turned into the ask's outcome. Two endings genuinely cannot tidy up: a runtime restart (the
-sidecar holding the prompt is gone) and a whole-run teardown (the provider's `finally` closes the client
-before the edit lands). The everyday case — one arm of a `with_deadline` expiring while the connection stays
-up — does tidy up.
+rather than turned into the ask's outcome. ONE ending genuinely cannot tidy up: a runtime restart, whose
+interrupted call takes the prompt's identity with it. A cancel and a whole-run teardown now do (the edit is
+a plain Web API call and nothing closes underneath it any more — in 0.4.0 the provider's `finally` closed
+the client first, so a torn-down run left its controls live).
 
 A `form`'s inputs are NOT validated, at all and by design: every box is optional, a blank one comes back as
 the empty string, and `submitted`'s @values@ is total over the declared fields. Nor COULD they be — the
 socket acknowledges every interaction the instant it arrives, which is exactly what closes the dialog, so
 this package can never answer a submission with per-field errors. Validate in the program and `ask` again.
 
-The wait rides one external call, so a runtime restart while it is open interrupts it under the
-at-most-once rule (a catchable panic) and leaves those controls stale, per above. That failure is the
-DESIGNED outcome, not a defect to absorb here: let the panic ride to your supervisor and restart the asking
-flow — whoever wanted the answer asks again — rather than guessing an answer that never landed.
+The wait rides one external call, and holds the Socket Mode connection the answer arrives over for exactly
+as long as it waits (shared with any other live `ask` or watch on the same app-level token). So a runtime
+restart while the question is open interrupts it under the at-most-once rule (a catchable panic) and leaves
+those controls stale, per above. That failure is the DESIGNED outcome, not a defect to absorb here: let the
+panic ride to your supervisor and ASK AGAIN — a fresh ask opens its own connection and posts its own
+question, which is the whole of the recovery — rather than guessing an answer that never landed.
 
 Raises `slack_error` when a Slack call fails: posting the question, or opening a `form`'s dialog (its
 three-second interaction token expired). A control past one of Slack's caps is that same failure — the
@@ -371,14 +410,18 @@ agent ask(
   @"The id of the channel to ask in — its membership is who may answer." channel: string,
   @"The question posted above the controls (Slack mrkdwn)." prompt: string,
   @"What the human may answer with: `button` / `select` / `form` values, rendered in one row in order. Each control's @id@ must be DISTINCT within one ask — the id IS the correlation key Slack carries back, so a repeat would make two controls indistinguishable (Slack rejects the duplicate outright)." controls: array[control],
-) -> answer with connection | io | prelude.throw[slack_error] {
-  slack_ask(client = connection(), channel = channel, prompt = prompt, controls = controls)
+) -> answer with credential | io | prelude.throw[slack_error] {
+  let tokens = credential()
+  slack_ask(bot_token = tokens.bot_token, app_token = tokens.app_token, channel = channel, prompt = prompt, controls = controls)
 }
 
-@"Low-level: post a prompt with its controls on a given client and await the first answer. Prefer the
-ask agent."
+@"Low-level: post a prompt with its controls and await the first answer. The Socket Mode connection the
+answer arrives over is opened for the extent of THIS call (shared with any other live call on the same
+@app_token@, closed when the last one ends), and the question posts only once it is up — a prompt nobody
+can answer is worse than no prompt. Prefer the ask agent."
 external agent slack_ask(
-  @"The opaque handle `create_slack_client` returned." client: string,
+  @"The bot token (`xoxb-…`) the question posts with." bot_token: string of private,
+  @"The app-level token (`xapp-…`) the answer arrives over." app_token: string of private,
   @"The id of the channel to ask in." channel: string,
   @"The question posted above the controls." prompt: string,
   @"The controls offered under the prompt." controls: array[control],
