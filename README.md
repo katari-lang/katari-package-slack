@@ -16,7 +16,7 @@ with it, which is what makes **re-forking a watcher after a runtime restart just
 - `slack.provider(bot_source = ..., app_source = ...)` — serves `slack.credential`, the workspace's two
   tokens, for the extent of the continuation. It connects nothing.
 - `slack.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
-  `slack.message` to your agent. Bot posts (this bot's own replies included) are not delivered, so
+  `slack.message(id, channel, author, text, files, thread)` to your agent. Bot posts (this bot's own replies included) are not delivered, so
   replying cannot loop. The callback's own argument is named `value` (0.4.0). It opens the Socket Mode
   connection for its own lifetime, so it raises `slack_error` when that connection will not open (0.5.0).
 - `slack.list_messages(channel, after ?= "", limit ?= 50) -> array[message]` — the channel's own history
@@ -508,7 +508,9 @@ import slack
 // The callback's argument is named `value`: that is what `watch_messages` calls it with.
 agent echo(value: slack.message) -> null {
   match (value) {
-    case slack.message(channel => channel, author => author, text => text, files => files, thread => thread) -> {
+    // Every field, including the `id` an echo does not need — a destructuring names the whole
+    // shape, and leaving one out here would teach a `message` that has no identity to keep.
+    case slack.message(id => _, channel => channel, author => author, text => text, files => files, thread => thread) -> {
       // `try_send` answers with its outcome. An echo has nobody to report to, so it drops the answer
       // deliberately — a bot that tells someone "posted" reads it instead.
       let _outcome = slack.try_send(
