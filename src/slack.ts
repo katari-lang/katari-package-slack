@@ -227,15 +227,75 @@ function firstShareTs(response: unknown): string | undefined {
  *  field is optional because the events API varies by subtype; the listener filters to the shapes it
  *  understands before delivering. */
 interface MessageEnvelope {
-  event: {
-    channel?: string;
-    user?: string;
-    text?: string;
-    thread_ts?: string;
-    subtype?: string;
-    bot_id?: string;
-    files?: Array<{ url_private_download?: string; url_private?: string; mimetype?: string }>;
-  };
+  event: ReadMessage;
+}
+
+/** The part of a message this sidecar reads, from either source: a Socket Mode `message` envelope or a
+ *  `conversations.history` page — the two shapes are the same events API shape, so one interface serves
+ *  both and the socket path and the gap read cannot drift on what a `slack.message` is made of. Every
+ *  field is optional because the events API varies by subtype; both readers filter to the shapes they
+ *  understand before delivering. */
+interface ReadMessage {
+  ts?: string;
+  channel?: string;
+  user?: string;
+  text?: string;
+  thread_ts?: string;
+  subtype?: string;
+  bot_id?: string;
+  files?: Array<{ url_private_download?: string; url_private?: string; mimetype?: string }>;
+}
+
+/** Is this a user's own post in the watched channel? A `bot_id` (this bot's replies included, so
+ *  delivering cannot loop) and every subtype except `file_share` (edits, deletions, joins — different
+ *  shapes, not new messages) are skipped. The remaining shapes always carry a user and a `ts`; one that
+ *  does not is not a user post, so it is skipped too. THE one filter, so a reconciled message is the
+ *  same message the socket would have delivered. */
+function isUserPost(event: ReadMessage): boolean {
+  if (event.user === undefined || event.ts === undefined) return false;
+  if (event.bot_id !== undefined) return false;
+  return event.subtype === undefined || event.subtype === "file_share";
+}
+
+/** Every attachment of one message, downloaded with the bot token as a bearer header (Slack has no
+ *  public file URLs) and lifted into `file` values — the half of a delivered message that costs
+ *  bandwidth, shared by the socket path and the gap read. One attachment that fails to download is
+ *  DROPPED rather than failing the whole message: a message minus one file is still worth handling, and
+ *  the alternative loses the text as well. */
+async function downloadAttachments(
+  event: ReadMessage,
+  botToken: string,
+  context: { file: (bytes: Uint8Array, options: { contentType?: string }) => Promise<KatariFile> },
+): Promise<KatariFile[]> {
+  const files: KatariFile[] = [];
+  for (const attachment of event.files ?? []) {
+    const url = attachment.url_private_download ?? attachment.url_private;
+    if (url === undefined) continue;
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${botToken}` } });
+    if (!response.ok) continue;
+    files.push(
+      await context.file(new Uint8Array(await response.arrayBuffer()), {
+        ...(attachment.mimetype === undefined ? {} : { contentType: attachment.mimetype }),
+      }),
+    );
+  }
+  return files;
+}
+
+/** One `slack.message` data value. THE one place the delivered shape is spelled, so the socket and the
+ *  gap read cannot grow apart — a field added here reaches both paths or neither. Called only for an
+ *  event `isUserPost` accepted, which is what makes the `?? ""` fallbacks unreachable rather than
+ *  lenient. */
+function messageValue(event: ReadMessage, files: KatariFile[]): KatariData {
+  return new KatariData("slack.message", {
+    // The message's own `ts`: what a caller keeps as a cursor and hands back to `list_messages`.
+    id: event.ts ?? "",
+    channel: event.channel ?? "",
+    author: event.user ?? "",
+    text: event.text ?? "",
+    files,
+    thread: event.thread_ts ?? null,
+  });
 }
 
 // ─── reading the argument's data values ───────────────────────────────────────────────────────────
@@ -683,6 +743,47 @@ katari.agent<{
   }
 });
 
+/** Slack's own recommended ceiling for one `conversations.history` page — the API allows 1000 and asks
+ *  callers not to. The ONE place the number is written: the Katari side documents the clamp in prose and
+ *  passes the caller's number through, so there is no second copy to drift. */
+const HISTORY_PAGE_MAX = 200;
+
+katari.agent<{ bot_token: string; channel: string; after: string; limit: number }>(
+  "slack_history",
+  async ({ bot_token, channel, after, limit }, context) => {
+    const web = webClientFor(bot_token);
+    try {
+      const asked = Number.isFinite(limit) ? Math.trunc(limit) : 1;
+      const response = await web.conversations.history({
+        channel,
+        limit: Math.min(Math.max(asked, 1), HISTORY_PAGE_MAX),
+        // `oldest` is EXCLUSIVE while `inclusive` stays false, which is exactly "after this message".
+        // Slack rejects an empty one, so an absent cursor simply omits it — the newest page, which is
+        // the shape a first run with nothing kept yet asks for.
+        ...(after === "" ? {} : { oldest: after }),
+      });
+      // Newest first out of Slack, posted order out of here — a caller replaying a gap runs the messages
+      // through the same handling in the order they were written.
+      const page = [...(response.messages ?? [])].reverse();
+      const values: KatariData[] = [];
+      for (const raw of page) {
+        // A history entry carries no `channel` of its own (the whole page is one channel's), so the
+        // asked-for channel is filled in — the delivered value names where the message is either way.
+        const event: ReadMessage = { ...raw, channel };
+        if (!isUserPost(event)) continue;
+        values.push(messageValue(event, await downloadAttachments(event, bot_token, context)));
+      }
+      return values;
+    } catch (error) {
+      // Classified auth vs api exactly as a send is: a token Slack rejects and a missing
+      // `channels:history` scope are the operator's to fix, everything else is this call's bad luck.
+      katari.throw(new KatariData(slackErrorConstructor(error), { message: slackErrorMessage(error) }));
+      // `katari.throw` never returns; the rethrow only satisfies the declared return type.
+      throw error;
+    }
+  },
+);
+
 katari.agent<{
   bot_token: string;
   app_token: string;
@@ -772,45 +873,19 @@ katari.agent<{
     return new Promise<never>((_resolve, reject) => {
       const listener = (envelope: MessageEnvelope) => {
         const event = envelope.event;
-        // Deliver only a user's own posts in the watched channel: a `bot_id` (this bot's replies
-        // included, so delivering cannot loop) and every subtype except `file_share` (edits,
-        // deletions, joins — different shapes, not new messages) are skipped. The remaining shapes
-        // always carry a user; one that does not is not a user post, so it is skipped too.
-        if (event.channel !== channel || event.user === undefined) return;
-        if (event.bot_id !== undefined) return;
-        if (event.subtype !== undefined && event.subtype !== "file_share") return;
-        const author = event.user;
-        const messageChannel = event.channel;
+        // Deliver only a user's own posts in the watched channel — the same filter `slack_history` runs,
+        // so a message read back out of the gap is a message this watch would have delivered.
+        if (event.channel !== channel || !isUserPost(event)) return;
         // Deliver back into the runtime as an inner delegation; the callback's effects escalate
         // through this call to the app's handlers. Attachments download from Slack's file URL (the
         // bot token as a bearer header — Socket Mode has no public downloads) and lift into `file`
-        // values first (one that fails to download is dropped rather than failing the whole
-        // message). A delivery failure tears the watch down (the app's panic clause reports it).
+        // values first. A delivery failure tears the watch down (the app's panic clause reports it).
         void (async () => {
-          const files: KatariFile[] = [];
-          for (const attachment of event.files ?? []) {
-            const url = attachment.url_private_download ?? attachment.url_private;
-            if (url === undefined) continue;
-            const response = await fetch(url, {
-              headers: { Authorization: `Bearer ${bot_token}` },
-            });
-            if (!response.ok) continue;
-            files.push(
-              await context.file(new Uint8Array(await response.arrayBuffer()), {
-                ...(attachment.mimetype === undefined ? {} : { contentType: attachment.mimetype }),
-              }),
-            );
-          }
           // One `message` data value, not a spread of positional fields: the callback's signature stays
-          // the same as its Discord twin's when either platform grows a field.
+          // the same as its Discord twin's when either platform grows a field — and it is built by the
+          // same two helpers `slack_history` uses, so the socket and the gap read deliver the same thing.
           await deliver_to.call({
-            value: new KatariData("slack.message", {
-              channel: messageChannel,
-              author,
-              text: event.text ?? "",
-              files,
-              thread: event.thread_ts ?? null,
-            }),
+            value: messageValue(event, await downloadAttachments(event, bot_token, context)),
           });
         })().catch((error) => {
           fail(error instanceof Error ? error : new Error(String(error)));

@@ -19,6 +19,12 @@ with it, which is what makes **re-forking a watcher after a runtime restart just
   `slack.message` to your agent. Bot posts (this bot's own replies included) are not delivered, so
   replying cannot loop. The callback's own argument is named `value` (0.4.0). It opens the Socket Mode
   connection for its own lifetime, so it raises `slack_error` when that connection will not open (0.5.0).
+- `slack.list_messages(channel, after ?= "", limit ?= 50) -> array[message]` — the channel's own history
+  after a message `ts`, **in posted order** (0.6.0). Socket Mode's at-least-once holds only while the
+  watch is RUNNING; a message posted while it is down is never delivered at all. So this is the other
+  half of "miss nothing": keep the `id` of the last message you handled somewhere durable and read
+  forward from it. Same `message` value the watch delivers — attachments downloaded, bot posts and
+  non-message subtypes dropped — so one handler serves both paths. Needs `channels:history`.
 - `slack.send_message(channel, text, files ?= [], thread_ts ?= null)` — post to a channel, returning
   the posted message's `ts`; a message's `ts` as `thread_ts` replies in its thread, and `files` upload
   as attachments.
@@ -36,6 +42,26 @@ with it, which is what makes **re-forking a watcher after a runtime restart just
   marker when anything was cut. **Pure**.
 - `slack.author_tag(source, author, length ?= 8) -> string` — the keyed pseudonym for a speaker's `U…`
   id, so a user id can reach a model or a log without being a user id.
+
+## New in 0.6.0 — a delivered message has an id, and the gap has a reader
+
+`watch_messages` has always documented the hole in Socket Mode's at-least-once — a message posted while
+the watch is down "is never delivered at all" — and told you that "a bot that must reconcile that gap
+reads the channel's history itself". The package did not offer a way to do it, and a delivered message
+carried no id to reconcile *from*. Both are fixed, on both twins at once:
+
+- **`slack.message` grew an `id`** — the message's own `ts`, the same value `send_message` returns.
+  (A top-level message's `id` is also the `thread` a reply to it would carry.) Additive: nothing in
+  Katari constructs a `message`, so existing callbacks compile unchanged.
+- **`slack.list_messages(channel, after, limit)`** reads forward from that `ts`, oldest first, one
+  `conversations.history` call with no socket involved. `limit` is clamped into 1-200 (Slack's own
+  recommendation), so a wide gap takes several calls; a SHORT answer is not proof the gap is closed
+  (dropped bot posts and skipped subtypes shorten it too) — an EMPTY one is.
+- It needs the **`channels:history`** scope (`groups:history` for a private channel), which watching a
+  channel does not by itself grant. A missing scope is `auth_error`, as any other.
+
+The filter, the shape and the attachment download are now written once in the sidecar and used by both
+paths, so a reconciled message cannot quietly differ from a watched one.
 
 ## Breaking changes in 0.5.0
 

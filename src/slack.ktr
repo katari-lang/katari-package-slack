@@ -116,6 +116,7 @@ thread the message was posted in, or `null` for a top-level message — pass it 
 `send_message`'s @thread_ts@ to reply where the message came from. (@thread@ is the Slack twin's one
 extra field: Discord has no `ts` that doubles as a thread address.)"
 data message(
+  @"This message's own `ts` — Slack's identity for it, the same value `send_message` returns, and the CURSOR `list_messages` reads after. Keep the id of the last message you handled and the gap around a restart can be closed later; drop it and those messages are simply never delivered. (A top-level message's own `ts` is also the `thread` a reply to it would carry.)" id: string,
   @"The channel the message was posted in." channel: string,
   @"The sender's raw Slack user id (`U…`)." author: string,
   @"The message text as Slack delivered it (mrkdwn)." text: string,
@@ -136,6 +137,17 @@ external agent slack_send(
   @"The parent message's `ts` to reply in its thread, or `null` to post to the channel." thread_ts: string | null,
   @"Files to upload as the message's attachments (`[]` for a plain text post)." files: array[file],
 ) -> string with prelude.throw[slack_error]
+
+@"Low-level: read a channel's recent messages with @bot_token@ (Slack `conversations.history`). Pure Web
+API — no socket, nothing kept between calls — so it behaves identically before and after a restart.
+@limit@ is clamped into 1-200 here, and the answer is reversed into POSTED ORDER (Slack answers newest
+first). Raises `slack_error` when the call fails. Prefer the list_messages agent."
+external agent slack_history(
+  @"The bot token to read with." bot_token: string of private,
+  @"The channel to read." channel: string,
+  @"Read only messages posted after this `ts`; empty reads the newest page." after: string,
+  @"How many messages to ask Slack for; clamped into 1-200." limit: integer,
+) -> array[message] with prelude.throw[slack_error]
 
 @"Low-level: listen on a channel and deliver each incoming message to a callback. The Socket Mode
 connection is opened for the extent of THIS call (shared with any other live call on the same
@@ -231,8 +243,10 @@ neither-guarantee: Slack acknowledges every event individually and re-sends one 
 lost to a dropped socket, so a message can be REPEATED but not missed. No dedup memory is kept here, so a
 bot that must not act twice dedupes on its own. What is outside the guarantee is the time when this call
 is NOT running: Socket Mode delivers to open sockets, so a message posted while the watcher is down (the
-gap around a runtime restart) is never delivered at all — a bot that must reconcile that gap reads the
-channel's history itself.
+gap around a runtime restart) is never delivered at all — a bot that must reconcile that gap keeps the
+`id` of the last message it handled somewhere durable and closes the gap with `list_messages`, which
+reads the channel's own history from that id. The socket is the fast path; the cursor plus the read is
+the complete one.
 
 THE CONNECTION IS THIS CALL'S. It opens when the watch starts (shared with any other live watch or `ask`
 on the same app-level token, closed when the last of them ends) and dies with the call, so a runtime
@@ -254,6 +268,39 @@ agent watch_messages[effect E](
 ) -> never with E | credential | io | prelude.throw[slack_error] {
   let tokens = credential()
   slack_watch(bot_token = tokens.bot_token, app_token = tokens.app_token, channel = channel, deliver_to = deliver_to)
+}
+
+@"THE GAP READER: a channel's messages posted after @after@, in POSTED ORDER — the reconciliation
+`watch_messages` tells you to write. Socket Mode's at-least-once holds only WHILE the watch is running;
+a message posted while it is down is never delivered at all, and nothing re-sends it. The only way back
+is a cursor you kept and a read that starts from it.
+
+@after@ is a message `ts`, not a wall clock: keep the `id` of the last message you handled (durably — a
+`var` dies with the run), hand it back here, and everything posted since arrives oldest first, ready to
+run through the same handling the watch would have run. An empty @after@ reads the newest @limit@
+instead, which is the shape for a first run with no cursor yet — the shape that does NOT reach back
+before the bot existed.
+
+The answer is the SAME `message` value the watch delivers, attachments downloaded into `file` values and
+bot posts dropped, so one handler serves both paths and a reconciled message cannot quietly differ from a
+watched one. That download is what the symmetry costs: a page of file-heavy history pays for every
+attachment on it, so keep @limit@ to what you will actually process.
+
+READING A WIDE GAP TAKES SEVERAL CALLS. @limit@ is clamped into 1-200 (Slack's own recommendation, well
+under the 1000 the API allows): read, handle, keep the last `id`, read again. A SHORT answer does not mean
+the gap is closed — dropped bot posts and skipped subtypes shorten it too — so the honest end condition is
+an EMPTY one. And nothing here dedups: this is a channel whose stream is ALREADY at-least-once, so a bot
+reading the gap needs the same handled-marker it needed anyway.
+
+Raises `slack_error` exactly as `send_message` does. It needs the `channels:history` (or
+`groups:history`) scope, which watching a channel does not by itself grant."
+agent list_messages(
+  @"The channel to read." channel: string,
+  @"The `ts` to read after — the `id` of the last message you handled. Empty reads the newest @limit@ messages instead." after: string ?= "",
+  @"How many messages to ask Slack for; clamped into 1-200." limit: integer ?= 50,
+) -> array[message] with credential | io | prelude.throw[slack_error] {
+  let tokens = credential()
+  slack_history(bot_token = tokens.bot_token, channel = channel, after = after, limit = limit)
 }
 
 // ─── the interaction plane ────────────────────────────────────────────────────────────────────────
