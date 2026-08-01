@@ -3,14 +3,19 @@
 // used to live in prose, in three places — this module's header, this README, and the discord README —
 // and by 2026-07 all three were stale and disagreed (two divergences, five, and six). A contract nothing
 // checks is a contract that drifts, and the drift was silent: `try_send` changed shape on one side only,
-// `author_tag` / `limits` / `check_controls` were added to one side only, and `deliver_to`'s argument was
-// named differently on both twins than on every other watch in the ecosystem.
+// `limits` / `check_controls` (and the since-returned `author_tag`) were added to one side only, and
+// `deliver_to`'s argument was named differently on both twins than on every other watch in the ecosystem.
 //
 // So the contract is a MACHINE now. This script reads both modules and compares their published surfaces:
 // every name, every data field, every agent argument, every type synonym's members. Anything that differs
 // must be DECLARED below, with a reason — and the declarations are the single source of truth the README's
 // "Divergences" table narrates. Adding a field to one side fails here, until it is either added to the
 // other or written down as a divergence.
+//
+// It also holds the twins to what they GAVE BACK. `fit_message` and `author_tag` were the same judgement
+// written twice here and are now the prelude's `string.fit` / `crypto.pseudonym`; a twin that grows either
+// of them again would be a third copy, and — because the two sides would grow it TOGETHER, to stay twins —
+// the symmetric comparison above would not notice. RETURNED is the list that does.
 //
 // It is not a type checker and does not need to be: `katari check` already proves each module internally.
 // What it proves is the thing no compiler can see — that two independently published packages still
@@ -105,6 +110,25 @@ const ONLY = [
     side: "discord",
     path: "submitted.display_name",
     why: "as `message.display_name`, on the interaction plane",
+  },
+];
+
+/** Names both twins RETURNED to the prelude — a judgement that was written twice here, once per platform,
+ *  and is now written once for everyone. Neither side may publish one again: a re-grown copy would be a
+ *  THIRD implementation of the arithmetic (`fit_message` overshot its own cap by the marker's length on
+ *  both sides before this) or of the security choice (`author_tag`'s keying, which the composition that
+ *  reaches for `sha256` gets wrong silently). The symmetric comparison above cannot catch it, because a
+ *  twin re-grows a name on BOTH sides to stay a twin — so it is caught here, by name. */
+const RETURNED = [
+  {
+    name: "fit_message",
+    to: "string.fit",
+    why: "cut-and-say-so is one arithmetic; the cap the platform enforces still comes from this package's `limits()`",
+  },
+  {
+    name: "author_tag",
+    to: "crypto.pseudonym",
+    why: "the keyed-HMAC choice belongs where every package can reach it; resolve the key with `credentials.resolve` at the call site",
   },
 ];
 
@@ -277,6 +301,19 @@ for (const [side, own, other] of [
   }
 }
 
+// Names that went back to the prelude, on either side.
+for (const returned of RETURNED) {
+  for (const [side, own] of [["slack", slack], ["discord", discord]]) {
+    if (!own.has(returned.name)) continue;
+    problems.push(
+      `${side} publishes \`${returned.name}\` again, which both twins returned to the prelude as` +
+        ` \`${returned.to}\` — ${returned.why}. Call the prelude's, or, if this package really does owe` +
+        ` the ecosystem a judgement the prelude does not carry, delete the entry from RETURNED and say` +
+        ` what changed.`,
+    );
+  }
+}
+
 // Members of the names both sides publish.
 for (const [name, entry] of slack) {
   const twin = twinName("slack", name);
@@ -357,8 +394,15 @@ if (problems.length > 0) {
 
 console.log(
   `the twin contract holds: ${slack.size} published name(s) on the slack side, ${discord.size} on the` +
-    ` discord side, ${ONLY.length} declared divergence(s), ${ALIASES.length} alias(es).\n`,
+    ` discord side, ${ONLY.length} declared divergence(s), ${ALIASES.length} alias(es),` +
+    ` ${RETURNED.length} name(s) returned to the prelude and still gone.\n`,
 );
+
+console.log("Returned to the prelude (neither twin may publish these again):");
+for (const returned of RETURNED) {
+  console.log(`  both     ${returned.name} → ${returned.to} — ${returned.why}`);
+}
+console.log("");
 
 console.log("Declared divergences (the source the README's table narrates):");
 for (const alias of ALIASES) {

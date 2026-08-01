@@ -1,16 +1,10 @@
 // The sidecar half of `slack.ktr` — the Socket Mode WebSocket plus the Web API client. Handlers
 // register under this file's module path (`slack.*`).
 //
-// EVERY HANDLER TAKES THE TOKENS IT ACTS WITH, and nothing on the Katari side points into this process.
-// That is the fix this file exists in the shape it does for: until 0.4.0 a connection was minted by
-// `create_slack_client`, kept in a module-level map, and named by an opaque handle the program held — and
-// a handle into one process's memory is not a durable value. A runtime restart replayed the program's
-// committed state into a fresh sidecar with an empty map, so `connectionOf` threw on every call and
-// re-forking the watcher handed the new fiber the same dead handle. What is kept here now is a CACHE
-// KEYED BY THE TOKENS: a `WebClient` per bot token (an HTTP wrapper, so a pure optimization) and one
-// shared Socket Mode connection per app-level token, held for exactly as long as the calls that need
-// events and closed when the last of them ends. A restart leaves the cache empty, which is all that it
-// means — the next call fills it, and the calls that were pointing at the old one are themselves gone.
+// Every handler takes the tokens it acts with, and nothing on the Katari side points into this process.
+// What is kept here is a cache keyed by those tokens: a `WebClient` per bot token, and one shared Socket
+// Mode connection per app-level token, held for as long as the calls that need events and closed when the
+// last of them ends. A restart leaves the cache empty, which the next call simply fills.
 //
 // Files cross in both directions: an outgoing message's `file` values download over the blob side
 // channel and upload to Slack (`files.uploadV2`); an incoming message's attachments download from
@@ -121,11 +115,8 @@ interface SharedSocket {
 const sharedSockets = new Map<string, SharedSocket>();
 
 /** Lease the shared socket for an app-level token, opening one if this is the first caller. It comes back
- *  BEFORE it has connected, deliberately: that lets a caller whose events start arriving the moment the
- *  connection is up — a watch — attach its listener synchronously and await `started` only after, so
- *  nothing arrives in the gap between the two. (The 0.4.0 shape connected at provider-install time and
- *  attached a listener whenever a watch happened to start, and every event in between was acknowledged and
- *  dropped.) An `ask` has no such gap to close: its own prompt does not exist until the connection is up. */
+ *  before it has connected, deliberately: a watch can then attach its listener synchronously and await
+ *  `started` only after, so no event arrives in the gap between the two. */
 function acquireSocket(appToken: string): SharedSocket {
   const existing = sharedSockets.get(appToken);
   if (existing !== undefined) {
@@ -133,16 +124,11 @@ function acquireSocket(appToken: string): SharedSocket {
     return existing;
   }
   const socket = new SocketModeClient({ appToken });
-  // Acknowledge every envelope the moment it arrives, independently of any watcher: Slack re-sends an
-  // event not acked within a few seconds, and a delivery into the runtime can take arbitrarily long, so
-  // acking from the delivery path would turn every slow handler into duplicates. A failed ack (the socket
-  // dropped mid-reply) is deliberately ignored — Slack just re-sends the envelope, which is the
-  // at-least-once contract the watch documents.
-  //
-  // The empty ack is also what an interaction needs: a `block_actions` wants nothing back, and an empty
-  // ack of a `view_submission` is exactly what CLOSES the submitted dialog. It is the reason a form's
-  // inputs cannot be rejected with per-field errors — the envelope is already answered by the time this
-  // package sees it, which `ask` documents as the contract.
+  // Acknowledge every envelope on arrival, independently of any watcher: a delivery into the runtime can
+  // take arbitrarily long, so acking from the delivery path would turn every slow handler into duplicates.
+  // A failed ack is ignored — Slack re-sends the envelope, which is the at-least-once contract. The empty
+  // ack of a `view_submission` is also what closes a submitted dialog, so a form's inputs cannot be
+  // rejected with per-field errors.
   socket.on("slack_event", ({ ack }: { ack: () => Promise<void> }) => {
     void ack().catch(() => {});
   });
@@ -162,22 +148,16 @@ function acquireSocket(appToken: string): SharedSocket {
   return shared;
 }
 
-/** Give up one lease; the last one out closes the socket. A socket left open keeps receiving events, and
- *  Slack round-robins each event across every socket open on the app token, so an abandoned socket would
- *  swallow (acknowledge) messages a live bot then never sees — the hazard the old package armed a `finally`
- *  around the whole RUN for. Ending with the last CALL is the same guarantee with a lifetime a restart
- *  cannot outlive. Lingering instead (holding it briefly in case another call wants it) would be a timer
- *  bought with a connection nobody is using, so the close is immediate and a re-fork pays a fresh connect. */
+/** Give up one lease; the last one out closes the socket immediately. Slack round-robins each event across
+ *  every socket open on an app token, so an abandoned socket would swallow (acknowledge) messages a live
+ *  bot then never sees. */
 function releaseSocket(shared: SharedSocket): void {
   shared.leases -= 1;
   if (shared.leases > 0) return;
   if (sharedSockets.get(shared.appToken) === shared) sharedSockets.delete(shared.appToken);
-  // `disconnect` ends the Socket Mode session — the SDK's documented shutdown: it stops reconnecting and
-  // closes the WebSocket. It runs however `started` SETTLED, and only once it has: a connect still in
-  // flight would race it (the SDK resolves a disconnect that finds no socket yet and then connects
-  // anyway), while a connect that FAILED after its WebSocket had opened leaves the SDK's own reconnect
-  // timer armed — an orphan that would keep stealing and acknowledging this app's events. Neither
-  // failure is anyone's to act on. The Web API client holds no connection, so nothing to release there.
+  // `disconnect` runs however `started` settled, and only once it has: a connect still in flight would
+  // race it (the SDK resolves a disconnect that finds no socket yet, then connects anyway), and a connect
+  // that failed after its WebSocket opened leaves the SDK's own reconnect timer armed.
   void shared.started
     .catch(() => {})
     .then(() => shared.socket.disconnect())
@@ -561,17 +541,10 @@ interface Answered {
   receipt: string;
 }
 
-/** Replace the prompt's controls with @outcome@, a one-line record of how the ask ended. EVERY ending goes
- *  through here — an answer (its receipt), a cancel (`(expired)`), a platform failure (`(failed)`) — because
- *  a question nobody is waiting on any more must not keep controls a member can still press: pressing a dead
- *  control shows Slack's own interaction failure, which reads as a broken bot. One `chat.update` call site,
- *  so the three endings cannot drift apart.
- *
- *  FIRE AND FORGET, and it swallows its own failures: no ending may be delayed by a cosmetic edit, nor broken
- *  by one. Losing a human's decision to a failed `chat.update` would be far worse than a prompt left looking
- *  live, and a cancel least of all should wait on Slack. The record is a fixed one-liner rather than an echo
- *  of what was submitted — a form's text is unbounded and would blow the block's own size cap, and what to
- *  post back is the program's decision, not this package's. */
+/** Replace the prompt's controls with @outcome@, a one-line record of how the ask ended. Every ending goes
+ *  through here — an answer, a cancel (`(expired)`), a platform failure (`(failed)`) — so a question nobody
+ *  is waiting on any more keeps no pressable control. Fire and forget, swallowing its own failures: no
+ *  ending may be delayed or broken by a cosmetic edit. */
 function stripControls(
   web: WebClient,
   channel: string,
@@ -671,12 +644,8 @@ function awaitAnswer(
       cleanup();
       reject(error instanceof Error ? error : new Error(String(error)));
     };
-    // The runtime cancelled the call (an expired `time.with_deadline`, a cancelled fiber, teardown): stop
-    // listening and settle. `fail` runs `cleanup`, so the socket listener and the abort listener both come
-    // off here — the ask holds no state anywhere else, so a cancelled ask leaks nothing. The caller strips
-    // the now-dead controls off the message. `KatariCancelledError` is the port's own expected-cancellation
-    // reply: any other rejection while aborted still confirms the cancel, but logs a diagnostic with it,
-    // and a deadline-wrapped ask is the RECOMMENDED shape — so its ordinary expiry must be silent.
+    // The runtime cancelled the call. `KatariCancelledError` is the port's expected-cancellation reply, so
+    // the ordinary expiry of a deadline-wrapped ask stays out of the diagnostics.
     const abort = () => fail(new KatariCancelledError());
     socket.on("interactive", listener);
     signal.addEventListener("abort", abort);
