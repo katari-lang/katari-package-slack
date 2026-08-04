@@ -11,7 +11,10 @@ types, same fields, same argument names, so a bot ports between them by swapping
   extent of the continuation. It connects nothing.
 - `slack.watch_messages(channel, deliver_to)` — serve a channel forever, delivering each incoming
   `slack.message(id, channel, author, text, files, thread)` to your agent, whose argument is named `value`.
-  Bot posts (this bot's own included) are not delivered, so replying cannot loop.
+  Bot posts (this bot's own included) are not delivered, so replying cannot loop. The watch supervises
+  itself — a runtime restart's interruption reopens the connection on a capped backoff, while
+  `auth_error` still stops it loudly; `slack_watch` is the mortal single-connection form for a caller
+  composing its own policy.
 - `slack.list_messages(channel, after ?= "", limit ?= 50) -> array[message]` — the channel's own history
   after a message `ts`, in posted order, as the same `message` the watch delivers. Needs `channels:history`.
 - `slack.send_message(channel, text, files ?= [], thread_ts ?= null) -> string` — post to a channel,

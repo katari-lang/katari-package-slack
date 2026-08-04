@@ -1,8 +1,9 @@
 // Slack over Socket Mode: the workspace's two tokens as an ambient capability, the message plane
 // (`watch_messages` in, `send_message` / `try_send` out) and the interaction plane (`ask`). The externals
 // live in `slack.ts`. Every call carries the tokens it acts with, so nothing here points into the
-// sidecar's memory and a watcher re-forked after a runtime restart simply connects. This is the Slack half
-// of a twin contract with the `discord` package, declared in `scripts/check-twin.mjs`.
+// sidecar's memory — which is what lets `watch_messages` supervise itself: its replay reconnects on
+// nothing but a fresh credential resolve. This is the Slack half of a twin contract with the `discord`
+// package, declared in `scripts/check-twin.mjs`.
 
 @"The Slack credentials a call acts with: the bot token (`xoxb-…`) the Web API authenticates with, and the
 app-level token (`xapp-…`) the Socket Mode WebSocket opens with. Both are `string of private`, so their
@@ -19,7 +20,7 @@ request credential() -> credential_data
 
 @"Provide the Slack credentials for the extent of the continuation, resolving @bot_source@ and
 @app_source@ at each `credential` request. Nothing is connected here: a Socket Mode connection belongs to
-the call that needs events, which is what lets a watcher re-forked after a restart simply work. A missing
+the call that needs events, which is what lets a replayed watch simply reconnect. A missing
 or unreadable secret raises `env.missing_secret` / `oauth.server_error` from this install site, on the
 first call that needs a token; a bad token is not this agent's failure at all and surfaces as
 `slack_error` from the call that used it."
@@ -96,7 +97,9 @@ external agent slack_history(
 connection is opened for the extent of this call (shared with any other live call on the same
 @app_token@, closed when the last one ends), and the listener is attached before it is used, so no event
 arrives before something is there to receive it. Raises `slack_error` when the connection cannot be
-opened — a bad app-level token is `auth_error`. Prefer the watch_messages agent."
+opened — a bad app-level token is `auth_error`. The one connection is the whole contract — no replay,
+no reconnection policy — which is what makes this the form for a caller composing its own supervision;
+`watch_messages` is that composition with the default policy."
 external agent slack_watch[effect E](
   @"The bot token (`xoxb-…`) an incoming attachment downloads with." bot_token: string of private,
   @"The app-level token (`xapp-…`) the Socket Mode WebSocket opens with." app_token: string of private,
@@ -169,13 +172,17 @@ A message posted while the watch is down is never delivered at all, so a bot tha
 keeps the `id` of the last message it handled somewhere durable and closes the gap with `list_messages`.
 
 The Socket Mode connection belongs to this call (shared with any other live watch or `ask` on the same
-app-level token) and dies with it, so a runtime restart interrupts the watch under the at-most-once rule
-and re-forking it is the whole of the recovery. Raises `slack_error` when the connection cannot be
-opened: `auth_error` for a bad app-level token, `api_error` for a transient network fault."
-agent watch_messages[effect E](
+app-level token) and dies with it — and the watch supervises itself: a panic, which is how a runtime
+restart interrupts the call under the at-most-once rule, reopens the connection with freshly resolved
+credentials, on an exponential backoff capped at fifteen minutes. A typed `slack_error` still flies:
+`auth_error` for a bad app-level token stops the watch loudly rather than retrying into a locked door,
+`api_error` for a transient network fault at open. The mortal single-connection form is `slack_watch`."
+agent watch_messages[effect E lacks supervise.interrupted](
   @"The id of the channel to listen on (e.g. \"C0123456789\")." channel: string,
   @"Called once per incoming message, with the whole message as one value; its effects E flow to the caller's handlers." deliver_to: agent (value: message) -> null with E,
 ) -> never with E | credential | io | prelude.throw[slack_error] {
+  use supervise.forever()
+  use supervise.signal_panics[never]()
   let tokens = credential()
   slack_watch(bot_token = tokens.bot_token, app_token = tokens.app_token, channel = channel, deliver_to = deliver_to)
 }
